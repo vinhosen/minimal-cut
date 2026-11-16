@@ -87,8 +87,10 @@ body,
   display: flex;
   flex-direction: column;
   height: 100vh;
+  height: 100dvh;
   width: 100vw;
   background: var(--bg-app);
+  overflow: hidden;
 }
 
 /* Top Header */
@@ -461,6 +463,7 @@ body,
   border-radius: 4px;
   box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
   cursor: grab;
+  touch-action: none;
 }
 .preview-canvas:active {
   cursor: grabbing;
@@ -830,4 +833,217 @@ input[type='range'].slider::-webkit-slider-thumb {
   font-size: 12px;
   font-weight: 500;
   box-shadow: 0 10px 25px rgba(0, 0, 0, 0.18);
+}
+
+/* Touch support for timeline scrubbing and clip dragging */
+.ruler-bar,
+.clip-block,
+.trim-handle,
+.playhead-cap {
+  touch-action: none;
+}
+
+.btn,
+.rail-item,
+.segmented-btn,
+.mobile-tab-btn {
+  touch-action: manipulation;
+}
+
+/* Mobile Bottom Navigation (hidden on desktop) */
+.mobile-tabbar {
+  display: none;
+}
+
+@media (max-width: 900px) {
+  .hide-mobile {
+    display: none !important;
+  }
+
+  .topbar {
+    height: 46px;
+    padding: 0 10px;
+    gap: 8px;
+  }
+
+  .workspace-upper {
+    flex-direction: column;
+    padding: 6px 6px 0 6px;
+    gap: 6px;
+  }
+
+  /* Show/hide panels according to active mobile tab */
+  .studio-shell[data-mobile-tab='timeline'] .sidebar-left,
+  .studio-shell[data-mobile-tab='timeline'] .inspector-panel {
+    display: none;
+  }
+
+  .studio-shell[data-mobile-tab='media'] .inspector-panel,
+  .studio-shell[data-mobile-tab='media'] .timeline-panel {
+    display: none;
+  }
+
+  .studio-shell[data-mobile-tab='inspector'] .sidebar-left,
+  .studio-shell[data-mobile-tab='inspector'] .timeline-panel {
+    display: none;
+  }
+
+  .studio-shell[data-mobile-tab='media'] .player-panel,
+  .studio-shell[data-mobile-tab='inspector'] .player-panel {
+    flex: none;
+    height: 30dvh;
+    min-height: 165px;
+  }
+
+  .sidebar-left,
+  .inspector-panel {
+    width: 100%;
+    flex: 1;
+    min-height: 0;
+  }
+
+  .rail {
+    width: 52px;
+    padding: 8px 4px;
+    overflow-y: auto;
+  }
+
+  .rail-item {
+    width: 44px;
+    height: 44px;
+    font-size: 9px;
+  }
+
+  .timeline-panel {
+    height: 38dvh;
+    min-height: 195px;
+    max-height: 260px;
+    margin: 6px;
+  }
+
+  .timeline-toolbar {
+    overflow-x: auto;
+    overflow-y: hidden;
+    flex-wrap: nowrap;
+    padding: 0 8px;
+    gap: 8px;
+    scrollbar-width: none;
+  }
+  .timeline-toolbar::-webkit-scrollbar {
+    display: none;
+  }
+
+  .track-headers {
+    width: 74px;
+  }
+
+  .track-header-item {
+    padding: 0 6px;
+    gap: 5px;
+    font-size: 10px;
+  }
+
+  .trim-handle {
+    width: 12px;
+  }
+
+  .playhead-cap {
+    width: 14px;
+    height: 14px;
+    margin-left: -6.25px;
+  }
+
+  .mobile-tabbar {
+    display: flex;
+    flex-shrink: 0;
+    height: calc(52px + env(safe-area-inset-bottom, 0px));
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    background: var(--bg-surface);
+    border-top: 1px solid var(--border-hairline);
+    align-items: center;
+    justify-content: space-around;
+    z-index: 40;
+  }
+
+  .mobile-tab-btn {
+    flex: 1;
+    height: 100%;
+    border: none;
+    background: transparent;
+    color: var(--text-secondary);
+    font-family: inherit;
+    font-size: 11px;
+    font-weight: 500;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 3px;
+    cursor: pointer;
+  }
+
+  .mobile-tab-btn.active {
+    color: var(--accent-text);
+    font-weight: 600;
+  }
+
+  .mobile-tab-dot {
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--accent);
+    margin-left: 4px;
+    vertical-align: middle;
+  }
+
+  .toast {
+    bottom: calc(62px + env(safe-area-inset-bottom, 0px));
+    left: 12px;
+    right: 12px;
+    text-align: center;
+  }
+}
+
+@media (max-width: 640px) {
+  .player-header {
+    height: 38px;
+    padding: 0 8px;
+    gap: 6px;
+  }
+
+  .player-stage {
+    padding: 8px;
+  }
+
+  .player-transport {
+    height: 42px;
+    padding: 0 8px;
+    gap: 6px;
+  }
+
+  .timecode {
+    font-size: 11px;
+  }
+
+  .modal-card {
+    max-height: 90dvh;
+    overflow-y: auto;
+    padding: 16px;
+  }
+}
+
+@media (max-width: 480px) {
+  .hide-xs {
+    display: none !important;
+  }
+
+  .brand-mark span {
+    font-size: 13px;
+  }
+
+  .btn {
+    padding: 0 9px;
+    font-size: 11px;
+  }
 }

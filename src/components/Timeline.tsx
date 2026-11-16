@@ -78,7 +78,7 @@ export const Timeline: React.FC<TimelineProps> = ({
     }
   }, [timelineWidth, displaySeconds, zoom]);
 
-  const startScrub = (ev: React.MouseEvent) => {
+  const startScrub = (ev: React.PointerEvent) => {
     ev.stopPropagation();
     const updateScrub = (clientX: number) => {
       const el = timelineInnerRef.current;
@@ -89,16 +89,18 @@ export const Timeline: React.FC<TimelineProps> = ({
     };
     updateScrub(ev.clientX);
 
-    const onMove = (m: MouseEvent) => updateScrub(m.clientX);
+    const onMove = (m: PointerEvent) => updateScrub(m.clientX);
     const onUp = () => {
-      window.removeEventListener('mousemove', onMove);
-      window.removeEventListener('mouseup', onUp);
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onUp);
     };
-    window.addEventListener('mousemove', onMove);
-    window.addEventListener('mouseup', onUp);
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp);
   };
 
-  const handleClipMouseDown = (ev: React.MouseEvent, clip: TimelineClip) => {
+  const handleClipPointerDown = (ev: React.PointerEvent, clip: TimelineClip) => {
     ev.stopPropagation();
     onSelectClip(clip.id);
 
@@ -116,7 +118,7 @@ export const Timeline: React.FC<TimelineProps> = ({
     const spd = clip.speed || 1;
     let moved = false;
 
-    const onMove = (m: MouseEvent) => {
+    const onMove = (m: PointerEvent) => {
       moved = true;
       const ds = (m.clientX - startX) / zoom;
 
@@ -157,12 +159,14 @@ export const Timeline: React.FC<TimelineProps> = ({
       if (moved) {
         onUpdateClip(clip.id, {}, true);
       }
-      window.removeEventListener('mousemove', onMove);
-      window.removeEventListener('mouseup', onUp);
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onUp);
     };
 
-    window.addEventListener('mousemove', onMove);
-    window.addEventListener('mouseup', onUp);
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp);
   };
 
   return (
@@ -231,7 +235,7 @@ export const Timeline: React.FC<TimelineProps> = ({
 
         <div className="timeline-scroll" onClick={() => onSelectClip(null)}>
           <div ref={timelineInnerRef} className="timeline-inner" style={{ width: timelineWidth }}>
-            <div className="ruler-bar" onMouseDown={startScrub}>
+            <div className="ruler-bar" onPointerDown={startScrub}>
               <canvas ref={rulerCanvasRef} style={{ display: 'block', height: '100%' }} />
             </div>
 
@@ -249,7 +253,7 @@ export const Timeline: React.FC<TimelineProps> = ({
                           left: clip.timelineStart * zoom,
                           width: Math.max(22, clip.duration * zoom),
                         }}
-                        onMouseDown={(e) => handleClipMouseDown(e, clip)}
+                        onPointerDown={(e) => handleClipPointerDown(e, clip)}
                         onClick={(e) => e.stopPropagation()}
                       >
                         {clip.track === 'audio' && asset?.peaks && (
@@ -277,7 +281,7 @@ export const Timeline: React.FC<TimelineProps> = ({
             })}
 
             <div className="playhead" style={{ left: playhead * zoom }}>
-              <div className="playhead-cap" onMouseDown={startScrub} />
+              <div className="playhead-cap" onPointerDown={startScrub} />
             </div>
           </div>
         </div>

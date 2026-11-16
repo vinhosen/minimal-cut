@@ -38,8 +38,8 @@ export const TopBar: React.FC<TopBarProps> = ({
           </div>
           <span>MinimalCut</span>
         </div>
-        <div className="topbar-divider" />
-        <div className="status-pill" title={webCodecsSupported ? 'พร้อม Export 120 FPS แบบ Offline' : 'ใช้ MediaRecorder'}>
+        <div className="topbar-divider hide-mobile" />
+        <div className="status-pill hide-mobile" title={webCodecsSupported ? 'พร้อม Export 120 FPS แบบ Offline' : 'ใช้ MediaRecorder'}>
           <span className="status-dot" />
           <span>{webCodecsSupported ? 'WebCodecs พร้อมใช้' : 'โหมดมาตรฐาน'}</span>
         </div>
@@ -52,8 +52,8 @@ export const TopBar: React.FC<TopBarProps> = ({
         <button className="btn btn-ghost btn-icon" onClick={onRedo} disabled={!canRedo} title="ทำซ้ำ (Ctrl+Y)">
           <Redo2 size={15} />
         </button>
-        <div className="topbar-divider" />
-        <span className="status-pill">
+        <div className="topbar-divider hide-xs" />
+        <span className="status-pill hide-xs">
           {resLabel} • {fps} FPS
         </span>
       </div>
@@ -66,11 +66,11 @@ export const TopBar: React.FC<TopBarProps> = ({
           title="ล้างโปรเจกต์เพื่อเริ่มใหม่"
         >
           <Trash2 size={14} />
-          <span>เริ่มใหม่</span>
+          <span className="hide-xs">เริ่มใหม่</span>
         </button>
         <button className="btn btn-dark" onClick={onOpenExport} disabled={!hasClips}>
           <Download size={14} />
-          <span>Export วิดีโอ</span>
+          <span>Export<span className="hide-xs"> วิดีโอ</span></span>
         </button>
       </div>
     </header>

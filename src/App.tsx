@@ -11,6 +11,7 @@ import { computeAudioPeaks, getCanvasDimensions, nextId } from './utils/timecode
 import { renderCompositionFrame } from './utils/renderer';
 import { exportProjectToMp4, type ExportProgress } from './utils/exporter';
 import { exportViaRustEngine, isRustBackendAvailable, uploadMediaToRust } from './utils/rustBridge';
+import { Film, FolderPlus, SlidersHorizontal } from 'lucide-react';
 import { TopBar } from './components/TopBar';
 import { MediaSidebar } from './components/MediaSidebar';
 import { PreviewPlayer } from './components/PreviewPlayer';
@@ -83,6 +84,7 @@ export function App() {
 
   // Export modal state
   const [exportOpen, setExportOpen] = useState(false);
+  const [mobileTab, setMobileTab] = useState<'timeline' | 'media' | 'inspector'>('timeline');
   const [isExporting, setIsExporting] = useState(false);
   const [exportProgress, setExportProgress] = useState<ExportProgress | null>(null);
   const [exportError, setExportError] = useState<string | null>(null);
@@ -1575,7 +1577,7 @@ export function App() {
   }, [appendAiLog, pushHistory, showToast]);
 
   return (
-    <div className="studio-shell">
+    <div className="studio-shell" data-mobile-tab={mobileTab}>
       <TopBar
         fps={exportSettings.fps}
         resolution={exportSettings.resolution}
@@ -1698,6 +1700,36 @@ export function App() {
         onCancelExport={() => exportAbortRef.current?.abort()}
         onClose={() => setExportOpen(false)}
       />
+
+      <nav className="mobile-tabbar" aria-label="สลับมุมมองมือถือ">
+        <button
+          type="button"
+          className={`mobile-tab-btn ${mobileTab === 'timeline' ? 'active' : ''}`}
+          onClick={() => setMobileTab('timeline')}
+        >
+          <Film size={16} />
+          <span>ไทม์ไลน์</span>
+        </button>
+        <button
+          type="button"
+          className={`mobile-tab-btn ${mobileTab === 'media' ? 'active' : ''}`}
+          onClick={() => setMobileTab('media')}
+        >
+          <FolderPlus size={16} />
+          <span>สื่อ &amp; เครื่องมือ</span>
+        </button>
+        <button
+          type="button"
+          className={`mobile-tab-btn ${mobileTab === 'inspector' ? 'active' : ''}`}
+          onClick={() => setMobileTab('inspector')}
+        >
+          <SlidersHorizontal size={16} />
+          <span>
+            ปรับแต่ง
+            {selectedClip && <span className="mobile-tab-dot" />}
+          </span>
+        </button>
+      </nav>
 
       {toast && <div className="toast">{toast}</div>}
     </div>

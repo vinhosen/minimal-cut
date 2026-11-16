@@ -58,7 +58,7 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({
     origY: number;
   } | null>(null);
 
-  const getCanvasCoords = (ev: React.MouseEvent | MouseEvent) => {
+  const getCanvasCoords = (ev: React.PointerEvent | PointerEvent) => {
     const canvas = canvasRef.current;
     if (!canvas) return { x: 0, y: 0 };
     const rect = canvas.getBoundingClientRect();
@@ -68,7 +68,7 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({
     };
   };
 
-  const handleMouseDown = (ev: React.MouseEvent) => {
+  const handlePointerDown = (ev: React.PointerEvent) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const W = canvas.width;
@@ -120,7 +120,7 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({
       origY,
     };
 
-    const onMove = (m: MouseEvent) => {
+    const onMove = (m: PointerEvent) => {
       const ds = dragStartRef.current;
       if (!ds) return;
       const cur = getCanvasCoords(m);
@@ -146,12 +146,14 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({
       setDragging(false);
       onSetDraggingPreview(false);
       dragStartRef.current = null;
-      window.removeEventListener('mousemove', onMove);
-      window.removeEventListener('mouseup', onUp);
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onUp);
     };
 
-    window.addEventListener('mousemove', onMove);
-    window.addEventListener('mouseup', onUp);
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp);
   };
 
   const handleWheel = (ev: React.WheelEvent) => {
@@ -217,7 +219,7 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({
           height={canvasDims[1]}
           className="preview-canvas"
           style={{ cursor: dragging ? 'grabbing' : 'grab' }}
-          onMouseDown={handleMouseDown}
+          onPointerDown={handlePointerDown}
           onWheel={handleWheel}
         />
         {clips.length === 0 && (
