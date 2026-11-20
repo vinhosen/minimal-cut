@@ -1,0 +1,35 @@
+{
+  "name": "MinimalCut Studio — โปรแกรมตัดต่อวิดีโอ 120 FPS",
+  "short_name": "MinimalCut",
+  "description": "เว็บตัดต่อวิดีโอสไตล์มินิมอล ขับเคลื่อนด้วย WebCodecs Hardware 120 FPS, FilmCraft GPU Compositor และระบบกู้คืนโปรเจกต์อัตโนมัติ",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#f6f7f9",
+  "theme_color": "#ffffff",
+  "lang": "th",
+  "icons": [
+    {
+      "src": "./favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    },
+    {
+      "src": "./icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "./icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    },
+    {
+      "src": "./icon-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}
