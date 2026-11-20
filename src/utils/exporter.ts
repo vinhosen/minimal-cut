@@ -1,7 +1,23 @@
+/**
+ * Deterministic Frame-Accurate Offline WebCodecs MP4 Export Pipeline (Phase 3).
+ *
+ * Strict Guardrails:
+ * - NEVER uses `canvas.captureStream()` or `MediaRecorder` for video export.
+ * - Steps offline frame-by-frame by exact non-drifting microsecond intervals:
+ *   `dt = 1 / fps`, `timestampUs = Math.round(frameIndex * (1_000_000 / fps))`.
+ * - Awaits explicit seek + decode completion (`seeked` + `readyState >= 2` + frame settle)
+ *   on dedicated full-resolution export `<video>` elements (immune to Proxy Mode & preview side-effects)
+ *   before compositing onto a dedicated `OffscreenCanvas`.
+ * - Immediately calls `.close()` on every `VideoFrame`, `AudioData`, and decoded override frame.
+ * - Renders timeline audio offline via `OfflineAudioContext`, encodes AAC `AudioData` aligned
+ *   to the same microsecond epoch (safely handling platform AAC negative priming timestamps),
+ *   flushes both encoders, and finalizes `mp4-muxer` inside a unified abort/cleanup lifecycle.
+ */
+
 import { Muxer, ArrayBufferTarget, FileSystemWritableFileStreamTarget } from 'mp4-muxer';
 import type { AspectRatio, ColorSettings, ExportSettings, MediaAsset, TimelineClip } from '../types/editor';
 import { getCanvasDimensions } from './timecode';
-import { renderCompositionFrame, type FrameProvider } from './renderer';
+import { renderCompositionFrame, type Canvas2DContext, type FrameProvider } from './renderer';
 import { clipSourceTime, findActiveClip } from './clipTime';
 import { audibleClips, ensureAssetAudio, scheduleClipAudio } from '../audio/scheduleClipAudio';
 import { getOpfsFileHandle, getStorageEstimate, opfsAvailable, opfsRemove } from '../storage/opfs';
@@ -16,11 +32,37 @@ export interface ExportProgress {
 export interface ExportResult {
   blob: Blob;
   filename: string;
-  engine: 'webcodecs' | 'mediarecorder';
+  engine: 'webcodecs';
   /** True when the file was already written to a user-picked FileSystemFileHandle via showSaveFilePicker. */
   savedDirectly?: boolean;
   /** Optional cleanup callback (e.g. deletes temporary OPFS export file after download). */
   cleanup?: () => Promise<void>;
+}
+
+export interface FrameTiming {
+  /** Timeline position in seconds (`frameIndex * (1 / fps)`). */
+  timeSec: number;
+  /** Exact presentation timestamp in microseconds (`Math.round(frameIndex * (1_000_000 / fps))`). */
+  timestampUs: number;
+  /** Exact frame duration in microseconds (`nextTimestampUs - timestampUs`) with zero cumulative drift. */
+  durationUs: number;
+}
+
+/** Computes exact, zero-drift microsecond timing for frame `frameIndex` at `fps`. */
+export function computeFrameTiming(frameIndex: number, fps: number): FrameTiming {
+  const dt = 1 / fps;
+  const timestampUs = Math.round(frameIndex * (1_000_000 / fps));
+  const nextTimestampUs = Math.round((frameIndex + 1) * (1_000_000 / fps));
+  return {
+    timeSec: frameIndex * dt,
+    timestampUs,
+    durationUs: Math.max(1, nextTimestampUs - timestampUs),
+  };
+}
+
+/** Computes exact audio chunk microsecond timestamp aligned to the video timeline epoch. */
+export function computeAudioTimestampUs(sampleOffset: number, sampleRate: number): number {
+  return Math.round((sampleOffset / sampleRate) * 1_000_000);
 }
 
 /**
@@ -52,74 +94,293 @@ export async function tryPickExportSaveHandle(suggestedName: string): Promise<Fi
   }
 }
 
-/**
- * Seeks an HTMLVideoElement to `targetTime` and waits until the frame is actually decoded
- * (`readyState >= 2 && !video.seeking`).
- */
-function seekVideoTo(video: HTMLVideoElement, targetTime: number): Promise<void> {
-  const clamped = Math.max(0, Math.min(targetTime, video.duration || targetTime));
-  if (!video.seeking && Math.abs(video.currentTime - clamped) < 0.002 && video.readyState >= 2) {
-    return Promise.resolve();
-  }
-  return new Promise((resolve) => {
-    let done = false;
-    const finish = () => {
-      if (done) return;
-      if (video.seeking || video.readyState < 2) {
-        setTimeout(() => {
-          if (!done) {
-            done = true;
-            cleanup();
-            resolve();
-          }
-        }, 16);
-        return;
-      }
-      done = true;
-      cleanup();
-      resolve();
-    };
-    const forceFinish = () => {
-      if (done) return;
-      done = true;
-      cleanup();
-      resolve();
-    };
+type VideoWithRVFC = HTMLVideoElement & {
+  requestVideoFrameCallback?: (cb: (now: number, metadata: unknown) => void) => number;
+  cancelVideoFrameCallback?: (handle: number) => void;
+};
+
+/** Wait until a newly created export `<video>` element has loaded metadata (`readyState >= 1`). */
+function waitForVideoMetadata(video: HTMLVideoElement, signal?: AbortSignal): Promise<void> {
+  if (video.readyState >= 1) return Promise.resolve();
+  if (signal?.aborted) return Promise.reject(new Error('ยกเลิกการบันทึกแล้ว'));
+  return new Promise((resolve, reject) => {
+    let settled = false;
     const cleanup = () => {
-      video.removeEventListener('seeked', finish);
-      video.removeEventListener('loadeddata', finish);
+      video.removeEventListener('loadedmetadata', onReady);
+      video.removeEventListener('loadeddata', onReady);
+      video.removeEventListener('error', onError);
+      signal?.removeEventListener('abort', onAbort);
       clearTimeout(timer);
     };
-    const timer = setTimeout(forceFinish, 1500);
-    video.addEventListener('seeked', finish);
-    video.addEventListener('loadeddata', finish);
-    video.currentTime = clamped;
+    const onReady = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve();
+    };
+    const onError = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(new Error('ไม่สามารถโหลดไฟล์วิดีโอต้นฉบับสำหรับการ Export ได้'));
+    };
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(new Error('ยกเลิกการบันทึกแล้ว'));
+    };
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (video.readyState >= 1) resolve();
+      else reject(new Error('หมดเวลารอโหลดข้อมูลเมตาดาตาของวิดีโอสำหรับการ Export'));
+    }, 5000);
+
+    signal?.addEventListener('abort', onAbort, { once: true });
+    video.addEventListener('loadedmetadata', onReady);
+    video.addEventListener('loadeddata', onReady);
+    video.addEventListener('error', onError);
   });
 }
 
-async function pickSupportedVideoCodec(width: number, height: number, bitrate: number, fps: number): Promise<string | null> {
-  if (!('VideoEncoder' in window)) return null;
-  const candidates = [
-    'avc1.640028', // H.264 High L4.0
-    'avc1.4d002a', // H.264 Main L4.2 (supports 1080p60/120)
+/**
+ * Explicitly seeks a paused `HTMLVideoElement` to `targetTime` and waits for:
+ * 1. Metadata readiness (`readyState >= 1`)
+ * 2. `seeked` event completion
+ * 3. `video.readyState >= 2 && !video.seeking` (`loadeddata`/`canplay` if needed)
+ * 4. Frame decode/compositor settle (`requestVideoFrameCallback` if fired during paused seek,
+ *    or `requestAnimationFrame` raced with a short background-tab-safe timer so hidden tabs never stall).
+ * Rejects instead of silently baking a black frame if `readyState < 2` at timeout.
+ */
+export async function seekAndSettleVideo(
+  video: HTMLVideoElement,
+  targetTime: number,
+  signal?: AbortSignal
+): Promise<void> {
+  if (signal?.aborted) {
+    throw new Error('ยกเลิกการบันทึกแล้ว');
+  }
+
+  video.muted = true;
+  if (!video.paused) video.pause();
+
+  if (video.readyState < 1) {
+    await waitForVideoMetadata(video, signal);
+  }
+
+  const maxSeekable =
+    Number.isFinite(video.duration) && video.duration > 0 ? Math.max(0, video.duration - 1e-4) : targetTime;
+  const clamped = Math.max(0, Math.min(targetTime, maxSeekable));
+
+  const alreadyAtTarget = !video.seeking && Math.abs(video.currentTime - clamped) < 0.001;
+  if (alreadyAtTarget && video.readyState >= 2) {
+    return;
+  }
+
+  return new Promise((resolve, reject) => {
+    const v = video as VideoWithRVFC;
+    let settled = false;
+    let seekedDone = alreadyAtTarget;
+    let vfcFired = false;
+    let vfcHandle: number | null = null;
+    let rafHandle: number | null = null;
+    let settleTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const cleanup = () => {
+      video.removeEventListener('seeked', onSeeked);
+      video.removeEventListener('loadeddata', onDataReady);
+      video.removeEventListener('canplay', onDataReady);
+      signal?.removeEventListener('abort', onAbort);
+      clearTimeout(safetyTimer);
+      if (settleTimer !== null) {
+        clearTimeout(settleTimer);
+        settleTimer = null;
+      }
+      if (vfcHandle !== null && typeof v.cancelVideoFrameCallback === 'function') {
+        try {
+          v.cancelVideoFrameCallback(vfcHandle);
+        } catch {
+          // ignore
+        }
+        vfcHandle = null;
+      }
+      if (rafHandle !== null && typeof cancelAnimationFrame === 'function') {
+        cancelAnimationFrame(rafHandle);
+        rafHandle = null;
+      }
+    };
+
+    const finishOk = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve();
+    };
+
+    const fail = (err: Error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(err);
+    };
+
+    const onAbort = () => {
+      fail(new Error('ยกเลิกการบันทึกแล้ว'));
+    };
+
+    const waitForFrameSettle = () => {
+      if (settled || !seekedDone || video.seeking || video.readyState < 2) return;
+      if (vfcFired) {
+        finishOk();
+        return;
+      }
+      // Prevent duplicate rAF / settle timer handles if both seeked and loadeddata fire
+      if (rafHandle !== null || settleTimer !== null) return;
+
+      const isHiddenTab = typeof document !== 'undefined' && document.hidden;
+      if (!isHiddenTab && typeof requestAnimationFrame === 'function') {
+        rafHandle = requestAnimationFrame(() => {
+          rafHandle = null;
+          finishOk();
+        });
+        // Short fallback timer prevents 2.5s stall if user switches to another tab mid-frame
+        settleTimer = setTimeout(() => {
+          settleTimer = null;
+          finishOk();
+        }, 50);
+      } else {
+        settleTimer = setTimeout(() => {
+          settleTimer = null;
+          finishOk();
+        }, 16);
+      }
+    };
+
+    const onSeeked = () => {
+      seekedDone = true;
+      if (!video.seeking && video.readyState >= 2) {
+        waitForFrameSettle();
+      }
+    };
+
+    const onDataReady = () => {
+      if (seekedDone && !video.seeking && video.readyState >= 2) {
+        waitForFrameSettle();
+      }
+    };
+
+    // Register rVFC BEFORE mutating currentTime so browsers that fire rVFC on paused seek latch immediately.
+    if (typeof v.requestVideoFrameCallback === 'function') {
+      try {
+        vfcHandle = v.requestVideoFrameCallback(() => {
+          vfcHandle = null;
+          vfcFired = true;
+          if (seekedDone && !video.seeking && video.readyState >= 2) {
+            finishOk();
+          }
+        });
+      } catch {
+        vfcHandle = null;
+      }
+    }
+
+    const safetyTimer = setTimeout(() => {
+      if (video.readyState >= 2) {
+        finishOk();
+      } else {
+        fail(new Error(`หมดเวลารอถอดรหัสเฟรมวิดีโอที่เวลา ${clamped.toFixed(2)}s (readyState=${video.readyState})`));
+      }
+    }, 2500);
+
+    signal?.addEventListener('abort', onAbort, { once: true });
+    video.addEventListener('seeked', onSeeked);
+    video.addEventListener('loadeddata', onDataReady);
+    video.addEventListener('canplay', onDataReady);
+
+    if (!alreadyAtTarget) {
+      video.currentTime = clamped;
+    } else if (!video.seeking && video.readyState >= 2) {
+      waitForFrameSettle();
+    }
+  });
+}
+
+interface SupportedVideoEncoderConfig {
+  codec: string;
+  hardwareAcceleration: HardwareAcceleration;
+  latencyMode: LatencyMode;
+}
+
+async function pickSupportedVideoConfig(
+  width: number,
+  height: number,
+  bitrate: number,
+  fps: number
+): Promise<SupportedVideoEncoderConfig | null> {
+  if (typeof window === 'undefined' || !('VideoEncoder' in window) || !('VideoFrame' in window)) {
+    return null;
+  }
+
+  const codecs = [
+    'avc1.640034', // H.264 High L5.2 (4K60 / 1080p120)
+    'avc1.640032', // H.264 High L5.0 (4K30)
+    'avc1.64002a', // H.264 High L4.2 (1080p60)
+    'avc1.640028', // H.264 High L4.0 (1080p30)
+    'avc1.4d002a', // H.264 Main L4.2
     'avc1.42001f', // H.264 Baseline L3.1
     'avc1.42E01E',
   ];
-  for (const codec of candidates) {
-    try {
-      const res = await VideoEncoder.isConfigSupported({
-        codec,
-        width,
-        height,
-        bitrate,
-        framerate: fps,
-      });
-      if (res.supported) return codec;
-    } catch {
-      // try next
+  // Prefer `latencyMode: 'realtime'` so H.264 encoders disable B-frame reordering and emit
+  // strictly monotonic DTS===PTS timestamps compatible with mp4-muxer.
+  const latencyModes: LatencyMode[] = ['realtime', 'quality'];
+  const accelModes: HardwareAcceleration[] = ['prefer-hardware', 'no-preference', 'prefer-software'];
+
+  for (const latencyMode of latencyModes) {
+    for (const hardwareAcceleration of accelModes) {
+      for (const codec of codecs) {
+        try {
+          const res = await VideoEncoder.isConfigSupported({
+            codec,
+            width,
+            height,
+            bitrate,
+            framerate: fps,
+            hardwareAcceleration,
+            latencyMode,
+          });
+          if (res.supported) {
+            return { codec, hardwareAcceleration, latencyMode };
+          }
+        } catch {
+          // try next candidate
+        }
+      }
     }
   }
   return null;
+}
+
+function createExportCanvas(width: number, height: number): {
+  canvas: OffscreenCanvas | HTMLCanvasElement;
+  ctx: Canvas2DContext;
+} {
+  if (typeof OffscreenCanvas !== 'undefined') {
+    const off = new OffscreenCanvas(width, height);
+    const ctx = off.getContext('2d', { alpha: false });
+    if (ctx) {
+      return { canvas: off, ctx };
+    }
+  }
+  const el = document.createElement('canvas');
+  el.width = width;
+  el.height = height;
+  const ctx = el.getContext('2d', { alpha: false });
+  if (!ctx) {
+    throw new Error('ไม่สามารถสร้าง 2D Canvas Context สำหรับการ Export ได้');
+  }
+  return { canvas: el, ctx };
 }
 
 export async function renderMixedAudioBuffer(
@@ -175,7 +436,7 @@ export async function exportProjectToMp4(params: {
   signal: AbortSignal;
   onProgress: (p: ExportProgress) => void;
   saveHandle?: FileSystemFileHandle | null;
-  /** Optional Phase 3 frame-accurate decoder callback `(asset, srcTimeSec) => Promise<CanvasImageSource | null>` */
+  /** Optional frame-accurate WebCodecs decoder callback `(asset, srcTimeSec) => Promise<CanvasImageSource | null>` */
   decodeFrame?: (asset: MediaAsset, srcTimeSec: number) => Promise<CanvasImageSource | null>;
 }): Promise<ExportResult> {
   const {
@@ -190,6 +451,15 @@ export async function exportProjectToMp4(params: {
     saveHandle,
     decodeFrame,
   } = params;
+
+  const checkAborted = () => {
+    if (signal.aborted) {
+      throw new Error('ยกเลิกการบันทึกแล้ว');
+    }
+  };
+
+  checkAborted();
+
   const [W, H] = getCanvasDimensions(aspectRatio, settings.resolution, false);
   const fps = settings.fps;
   const bitrate = settings.bitrateMbps * 1_000_000;
@@ -211,28 +481,76 @@ export async function exportProjectToMp4(params: {
     }
   }
 
-  const codec = await pickSupportedVideoCodec(W, H, bitrate, fps);
+  checkAborted();
 
-  if (codec && 'VideoFrame' in window) {
-    onProgress({
-      percent: 1,
-      message: `ใช้ WebCodecs Streaming (${W}×${H} @ ${fps} FPS • ${codec})`,
-      currentFrame: 0,
-      totalFrames,
-    });
+  const videoConfig = await pickSupportedVideoConfig(W, H, bitrate, fps);
+  if (!videoConfig) {
+    throw new Error(
+      `เบราว์เซอร์ไม่รองรับ WebCodecs VideoEncoder (H.264 ${W}×${H} @ ${fps} FPS) — กรุณาใช้ Chrome / Edge / Safari รุ่นล่าสุด หรือปรับความละเอียดลง`
+    );
+  }
 
-    const mixedAudio = await renderMixedAudioBuffer(totalDuration, clips, assets);
-    const hasAudioEncoder = Boolean(mixedAudio && 'AudioEncoder' in window && 'AudioData' in window);
-    const expectedAudioChunks = hasAudioEncoder && mixedAudio ? Math.ceil(mixedAudio.length / 1024) + 32 : 0;
+  onProgress({
+    percent: 2,
+    message: `เตรียม WebCodecs Offline (${W}×${H} @ ${fps} FPS • ${videoConfig.codec})`,
+    currentFrame: 0,
+    totalFrames,
+  });
+
+  checkAborted();
+
+  const mixedAudio = await renderMixedAudioBuffer(totalDuration, clips, assets);
+  checkAborted();
+
+  let hasAudioEncoder = false;
+  if (mixedAudio && 'AudioEncoder' in window && 'AudioData' in window) {
+    try {
+      const audioSupport = await AudioEncoder.isConfigSupported({
+        codec: 'mp4a.40.2',
+        numberOfChannels: 2,
+        sampleRate: 48000,
+        bitrate: 192_000,
+      });
+      hasAudioEncoder = Boolean(audioSupport.supported);
+    } catch {
+      hasAudioEncoder = false;
+    }
+  }
+  checkAborted();
+
+  const expectedAudioChunks = hasAudioEncoder && mixedAudio ? Math.ceil(mixedAudio.length / 1024) + 32 : 0;
+
+  // Unified lifecycle variables guarded by try/catch/finally so zero streams, OPFS files,
+  // encoders, or dedicated export <video> elements can ever leak on error or abort.
+  let writableStream: FileSystemWritableFileStream | null = null;
+  let streamClosed = false;
+  let opfsTempHandle: FileSystemFileHandle | null = null;
+  let opfsTempPath: string | null = null;
+  let memoryTarget: ArrayBufferTarget | null = null;
+  let savedDirectly = false;
+  let videoEncoder: VideoEncoder | null = null;
+  const exportVideoEls = new Map<string, HTMLVideoElement>();
+
+  const getExportVideoEl = (asset: MediaAsset): HTMLVideoElement | undefined => {
+    const existing = exportVideoEls.get(asset.id);
+    if (existing) return existing;
+    if (typeof document !== 'undefined' && asset.url) {
+      // Dedicated paused full-resolution element bound to original `asset.url` (immune to Proxy Mode & preview listeners)
+      const el = document.createElement('video');
+      el.src = asset.url;
+      el.muted = true;
+      el.playsInline = true;
+      el.preload = 'auto';
+      exportVideoEls.set(asset.id, el);
+      return el;
+    }
+    return asset.videoEl;
+  };
+
+  try {
+    let muxerTarget: ArrayBufferTarget | FileSystemWritableFileStreamTarget;
 
     // 3-tier Streaming Target: 1) User FileSystemFileHandle -> 2) OPFS disk stream -> 3) ArrayBuffer fallback
-    let writableStream: FileSystemWritableFileStream | null = null;
-    let opfsTempHandle: FileSystemFileHandle | null = null;
-    let opfsTempPath: string | null = null;
-    let memoryTarget: ArrayBufferTarget | null = null;
-    let muxerTarget: ArrayBufferTarget | FileSystemWritableFileStreamTarget;
-    let savedDirectly = false;
-
     if (saveHandle) {
       try {
         writableStream = await saveHandle.createWritable();
@@ -252,7 +570,10 @@ export async function exportProjectToMp4(params: {
       } catch {
         writableStream = null;
         opfsTempHandle = null;
-        opfsTempPath = null;
+        if (opfsTempPath) {
+          await opfsRemove(opfsTempPath).catch(() => {});
+          opfsTempPath = null;
+        }
       }
     }
 
@@ -275,6 +596,7 @@ export async function exportProjectToMp4(params: {
             sampleRate: 48000,
           }
         : undefined,
+      firstTimestampBehavior: 'offset',
       fastStart: writableStream
         ? {
             expectedVideoChunks: totalFrames + 32,
@@ -283,280 +605,249 @@ export async function exportProjectToMp4(params: {
         : 'in-memory',
     });
 
-    let encoderError: Error | null = null;
-    const videoEncoder = new VideoEncoder({
-      output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
+    let videoEncoderError: Error | null = null;
+    videoEncoder = new VideoEncoder({
+      output: (chunk, meta) => {
+        try {
+          muxer.addVideoChunk(chunk, meta);
+        } catch (err) {
+          videoEncoderError = err instanceof Error ? err : new Error(String(err));
+        }
+      },
       error: (err) => {
-        encoderError = err;
+        videoEncoderError = err instanceof Error ? err : new Error(String(err));
       },
     });
 
     videoEncoder.configure({
-      codec,
+      codec: videoConfig.codec,
       width: W,
       height: H,
       bitrate,
       framerate: fps,
-      hardwareAcceleration: 'prefer-hardware',
+      hardwareAcceleration: videoConfig.hardwareAcceleration,
+      latencyMode: videoConfig.latencyMode,
     });
 
-    try {
-      if (hasAudioEncoder && mixedAudio) {
-        const audioEncoder = new AudioEncoder({
-          output: (chunk, meta) => muxer.addAudioChunk(chunk, meta),
-          error: (err) => {
-            console.warn('AudioEncoder warning:', err);
-          },
-        });
-        try {
-          audioEncoder.configure({
-            codec: 'mp4a.40.2',
-            numberOfChannels: 2,
-            sampleRate: 48000,
-            bitrate: 192_000,
-          });
+    // 1. Offline Audio Encoding (aligned to microsecond epoch 0 µs; safely normalizes negative AAC priming timestamps)
+    if (hasAudioEncoder && mixedAudio) {
+      onProgress({
+        percent: 5,
+        message: 'กำลังเข้ารหัสเสียง AAC (OfflineAudioContext)...',
+        currentFrame: 0,
+        totalFrames,
+      });
 
-          const ch0 = mixedAudio.getChannelData(0);
-          const ch1 = mixedAudio.numberOfChannels > 1 ? mixedAudio.getChannelData(1) : ch0;
-          const chunkFrames = 1024;
-          for (let offset = 0; offset < mixedAudio.length; offset += chunkFrames) {
-            if (signal.aborted) throw new Error('ยกเลิกการบันทึกแล้ว');
-            const frames = Math.min(chunkFrames, mixedAudio.length - offset);
-            const planar = new Float32Array(frames * 2);
-            planar.set(ch0.subarray(offset, offset + frames), 0);
-            planar.set(ch1.subarray(offset, offset + frames), frames);
-            const audioData = new AudioData({
-              format: 'f32-planar',
-              sampleRate: 48000,
-              numberOfFrames: frames,
-              numberOfChannels: 2,
-              timestamp: Math.round((offset / 48000) * 1_000_000),
-              data: planar,
-            });
-            try {
-              audioEncoder.encode(audioData);
-            } finally {
-              audioData.close();
+      let audioEncoderError: Error | null = null;
+      let firstAudioTs: number | null = null;
+      let lastAudioTs = -1;
+
+      const audioEncoder = new AudioEncoder({
+        output: (chunk, meta) => {
+          try {
+            if (firstAudioTs === null) {
+              firstAudioTs = chunk.timestamp < 0 ? chunk.timestamp : 0;
+            }
+            const shifted = Math.max(0, chunk.timestamp - firstAudioTs);
+            const ts = shifted <= lastAudioTs ? lastAudioTs + 1 : shifted;
+            lastAudioTs = ts;
+            muxer.addAudioChunk(chunk, meta, ts);
+          } catch (err) {
+            audioEncoderError = err instanceof Error ? err : new Error(String(err));
+          }
+        },
+        error: (err) => {
+          audioEncoderError = err instanceof Error ? err : new Error(String(err));
+        },
+      });
+
+      try {
+        audioEncoder.configure({
+          codec: 'mp4a.40.2',
+          numberOfChannels: 2,
+          sampleRate: 48000,
+          bitrate: 192_000,
+        });
+
+        const ch0 = mixedAudio.getChannelData(0);
+        const ch1 = mixedAudio.numberOfChannels > 1 ? mixedAudio.getChannelData(1) : ch0;
+        const chunkFrames = 1024;
+        for (let offset = 0; offset < mixedAudio.length; offset += chunkFrames) {
+          checkAborted();
+          if (audioEncoderError) throw audioEncoderError;
+
+          while (audioEncoder.encodeQueueSize > 32) {
+            checkAborted();
+            if (audioEncoderError) throw audioEncoderError;
+            await new Promise((r) => setTimeout(r, 4));
+          }
+
+          const frames = Math.min(chunkFrames, mixedAudio.length - offset);
+          const planar = new Float32Array(frames * 2);
+          planar.set(ch0.subarray(offset, offset + frames), 0);
+          planar.set(ch1.subarray(offset, offset + frames), frames);
+
+          const audioData = new AudioData({
+            format: 'f32-planar',
+            sampleRate: 48000,
+            numberOfFrames: frames,
+            numberOfChannels: 2,
+            timestamp: computeAudioTimestampUs(offset, 48000),
+            data: planar,
+          });
+          try {
+            audioEncoder.encode(audioData);
+          } finally {
+            audioData.close();
+          }
+        }
+        await audioEncoder.flush();
+        if (audioEncoderError) throw audioEncoderError;
+      } finally {
+        if (audioEncoder.state !== 'closed') audioEncoder.close();
+      }
+    }
+
+    // 2. Dedicated OffscreenCanvas + Deterministic Offline Frame-by-Frame Video Compositing
+    const { canvas: exportCanvas, ctx } = createExportCanvas(W, H);
+
+    for (let f = 0; f < totalFrames; f++) {
+      checkAborted();
+      if (videoEncoderError) throw videoEncoderError;
+
+      const timing = computeFrameTiming(f, fps);
+      const t = timing.timeSec;
+      const activeVideo = findActiveClip(clips, 'video', t);
+      let decodedOverride: CanvasImageSource | null = null;
+
+      if (activeVideo && activeVideo.mediaId) {
+        const asset = assets.get(activeVideo.mediaId);
+        if (asset) {
+          const srcT = clipSourceTime(activeVideo, t);
+          if (decodeFrame) {
+            decodedOverride = await decodeFrame(asset, srcT);
+          }
+          if (!decodedOverride) {
+            const exportVid = getExportVideoEl(asset);
+            if (exportVid) {
+              await seekAndSettleVideo(exportVid, srcT, signal);
             }
           }
-          await audioEncoder.flush();
-        } finally {
-          if (audioEncoder.state !== 'closed') audioEncoder.close();
         }
       }
 
-      const canvas = document.createElement('canvas');
-      canvas.width = W;
-      canvas.height = H;
-      const ctx = canvas.getContext('2d', { alpha: false })!;
-      const frameDurationUs = Math.round(1_000_000 / fps);
-
-      assets.forEach((a) => {
-        if (a.videoEl && !a.videoEl.paused) a.videoEl.pause();
-      });
-
-      for (let f = 0; f < totalFrames; f++) {
-        if (signal.aborted) {
-          throw new Error('ยกเลิกการบันทึกแล้ว');
-        }
-        if (encoderError) throw encoderError;
-
-        const t = f / fps;
-        const activeVideo = findActiveClip(clips, 'video', t);
-        let decodedOverride: CanvasImageSource | null = null;
-
-        if (activeVideo && activeVideo.mediaId) {
-          const asset = assets.get(activeVideo.mediaId);
-          if (asset) {
-            const srcT = clipSourceTime(activeVideo, t);
-            if (decodeFrame) {
-              decodedOverride = await decodeFrame(asset, srcT);
-            }
-            if (!decodedOverride && asset.videoEl) {
-              await seekVideoTo(asset.videoEl, srcT);
-            }
-          }
-        }
-
+      try {
         const frameProvider: FrameProvider | undefined = decodedOverride
           ? (clip) => (clip.id === activeVideo?.id ? decodedOverride ?? undefined : undefined)
           : undefined;
 
         renderCompositionFrame(ctx, W, H, t, clips, assets, colors, false, {
           frameProvider,
+          videoSource: (clip) => (clip.mediaId ? exportVideoEls.get(clip.mediaId) : undefined),
         });
-
+      } finally {
         if (decodedOverride && 'close' in decodedOverride && typeof decodedOverride.close === 'function') {
           decodedOverride.close();
         }
-
-        while (videoEncoder.encodeQueueSize > 12) {
-          if (signal.aborted) throw new Error('ยกเลิกการบันทึกแล้ว');
-          if (encoderError) throw encoderError;
-          await new Promise((r) => setTimeout(r, 4));
-        }
-
-        const frame = new VideoFrame(canvas, {
-          timestamp: f * frameDurationUs,
-          duration: frameDurationUs,
-        });
-        try {
-          videoEncoder.encode(frame, { keyFrame: f % fps === 0 });
-        } finally {
-          frame.close();
-        }
-
-        if (f % Math.max(1, Math.floor(fps / 6)) === 0 || f === totalFrames - 1) {
-          const pct = Math.min(99, Math.round(((f + 1) / totalFrames) * 100));
-          onProgress({
-            percent: pct,
-            message: `กำลังเรนเดอร์เฟรม ${f + 1} / ${totalFrames} (${fps} FPS)`,
-            currentFrame: f + 1,
-            totalFrames,
-          });
-          await new Promise((r) => setTimeout(r, 0));
-        }
       }
 
-      onProgress({
-        percent: 99,
-        message: 'กำลังปิดและบันทึกสตรีม MP4...',
-        currentFrame: totalFrames,
-        totalFrames,
+      while (videoEncoder.encodeQueueSize > 12) {
+        checkAborted();
+        if (videoEncoderError) throw videoEncoderError;
+        await new Promise((r) => setTimeout(r, 4));
+      }
+
+      const frame = new VideoFrame(exportCanvas, {
+        timestamp: timing.timestampUs,
+        duration: timing.durationUs,
       });
+      try {
+        videoEncoder.encode(frame, { keyFrame: f % fps === 0 });
+      } finally {
+        frame.close();
+      }
 
-      await videoEncoder.flush();
-    } catch (err) {
-      if (writableStream) {
-        await writableStream.abort().catch(() => {});
-      }
-      if (opfsTempPath) {
-        await opfsRemove(opfsTempPath);
-      }
-      throw err;
-    } finally {
-      if (videoEncoder.state !== 'closed') {
-        videoEncoder.close();
+      if (f % Math.max(1, Math.floor(fps / 6)) === 0 || f === totalFrames - 1) {
+        const pct = Math.min(98, 10 + Math.round(((f + 1) / totalFrames) * 88));
+        onProgress({
+          percent: pct,
+          message: `กำลังเรนเดอร์เฟรม ${f + 1} / ${totalFrames} (${fps} FPS)`,
+          currentFrame: f + 1,
+          totalFrames,
+        });
+        await new Promise((r) => setTimeout(r, 0));
       }
     }
+
+    onProgress({
+      percent: 99,
+      message: 'กำลัง Flush ตัวเข้ารหัสและปิดสตรีม MP4...',
+      currentFrame: totalFrames,
+      totalFrames,
+    });
+
+    await videoEncoder.flush();
+    if (videoEncoderError) throw videoEncoderError;
+    checkAborted();
 
     muxer.finalize();
 
     if (writableStream) {
       await writableStream.close();
+      streamClosed = true;
     }
-
-    if (savedDirectly && saveHandle) {
-      const file = await saveHandle.getFile();
-      return {
-        blob: file,
-        filename: saveHandle.name || filename,
-        engine: 'webcodecs',
-        savedDirectly: true,
-      };
+  } catch (err) {
+    if (writableStream && !streamClosed) {
+      await writableStream.abort().catch(() => {});
     }
-
-    if (opfsTempHandle && opfsTempPath) {
-      const file = await opfsTempHandle.getFile();
-      const tempRel = opfsTempPath;
-      return {
-        blob: file,
-        filename,
-        engine: 'webcodecs',
-        cleanup: () => opfsRemove(tempRel),
-      };
+    if (opfsTempPath) {
+      await opfsRemove(opfsTempPath).catch(() => {});
     }
-
-    const blob = new Blob([memoryTarget!.buffer], { type: 'video/mp4' });
-    return {
-      blob,
-      filename,
-      engine: 'webcodecs',
-    };
+    throw err;
+  } finally {
+    if (videoEncoder && videoEncoder.state !== 'closed') {
+      videoEncoder.close();
+    }
+    exportVideoEls.forEach((el) => {
+      el.pause();
+      el.removeAttribute('src');
+      el.load();
+    });
+    exportVideoEls.clear();
   }
 
-  // Fallback to MediaRecorder (for browsers without WebCodecs VideoEncoder)
   onProgress({
-    percent: 1,
-    message: `เบราว์เซอร์ไม่รองรับ WebCodecs — ใช้ MediaRecorder (${W}×${H} @ ${fps} FPS)`,
-    currentFrame: 0,
+    percent: 100,
+    message: 'บันทึกไฟล์ MP4 เสร็จสมบูรณ์',
+    currentFrame: totalFrames,
     totalFrames,
   });
 
-  const canvas = document.createElement('canvas');
-  canvas.width = W;
-  canvas.height = H;
-  const ctx = canvas.getContext('2d', { alpha: false })!;
-  const stream = canvas.captureStream(fps);
-  const mime =
-    ['video/mp4', 'video/webm;codecs=vp8', 'video/webm'].find((m) => MediaRecorder.isTypeSupported(m)) || '';
-  const recorder = mime ? new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: bitrate }) : new MediaRecorder(stream);
-  const chunks: Blob[] = [];
-  recorder.ondataavailable = (e) => {
-    if (e.data.size > 0) chunks.push(e.data);
-  };
-
-  return new Promise((resolve, reject) => {
-    recorder.onstop = () => {
-      assets.forEach((a) => {
-        if (a.videoEl && !a.videoEl.paused) a.videoEl.pause();
-      });
-      if (signal.aborted) return reject(new Error('ยกเลิกการบันทึกแล้ว'));
-      const isMp4 = (recorder.mimeType || '').includes('mp4');
-      const blob = new Blob(chunks, { type: isMp4 ? 'video/mp4' : 'video/webm' });
-      resolve({
-        blob,
-        filename: `MinimalCut_${W}x${H}_${fps}fps.${isMp4 ? 'mp4' : 'webm'}`,
-        engine: 'mediarecorder',
-      });
+  if (savedDirectly && saveHandle) {
+    const file = await saveHandle.getFile();
+    return {
+      blob: file,
+      filename: saveHandle.name || filename,
+      engine: 'webcodecs',
+      savedDirectly: true,
     };
+  }
 
-    recorder.start(500);
-    const start = performance.now();
-    const tick = setInterval(() => {
-      if (signal.aborted) {
-        clearInterval(tick);
-        recorder.stop();
-        return;
-      }
-      const elapsed = (performance.now() - start) / 1000;
-      if (elapsed >= totalDuration) {
-        clearInterval(tick);
-        recorder.stop();
-        return;
-      }
+  if (opfsTempHandle && opfsTempPath) {
+    const file = await opfsTempHandle.getFile();
+    const tempRel = opfsTempPath;
+    return {
+      blob: file,
+      filename,
+      engine: 'webcodecs',
+      cleanup: () => opfsRemove(tempRel),
+    };
+  }
 
-      const activeVideo = findActiveClip(clips, 'video', elapsed);
-      assets.forEach((asset) => {
-        if (asset.type !== 'video' || !asset.videoEl) return;
-        const vid = asset.videoEl;
-        if (!activeVideo || activeVideo.mediaId !== asset.id) {
-          if (!vid.paused) vid.pause();
-          return;
-        }
-        const tgt = clipSourceTime(activeVideo, elapsed);
-        vid.muted = true;
-        if (activeVideo.reverse) {
-          if (!vid.paused) vid.pause();
-          if (!vid.seeking && Math.abs(vid.currentTime - tgt) > 0.02) {
-            vid.currentTime = Math.max(0, Math.min(tgt, asset.duration));
-          }
-        } else {
-          vid.playbackRate = activeVideo.speed || 1;
-          if (!vid.seeking && Math.abs(vid.currentTime - tgt) > 0.25) {
-            vid.currentTime = Math.max(0, Math.min(tgt, asset.duration));
-          }
-          if (vid.paused) vid.play().catch(() => {});
-        }
-      });
-
-      renderCompositionFrame(ctx, W, H, elapsed, clips, assets, colors, false, { holdIfNotReady: true });
-      onProgress({
-        percent: Math.min(99, Math.round((elapsed / totalDuration) * 100)),
-        message: `กำลังบันทึก ${elapsed.toFixed(1)}s / ${totalDuration.toFixed(1)}s`,
-        currentFrame: Math.floor(elapsed * fps),
-        totalFrames,
-      });
-    }, Math.max(8, Math.floor(1000 / Math.min(fps, 60))));
-  });
+  const blob = new Blob([memoryTarget!.buffer], { type: 'video/mp4' });
+  return {
+    blob,
+    filename,
+    engine: 'webcodecs',
+  };
 }

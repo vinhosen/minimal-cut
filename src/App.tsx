@@ -11,7 +11,9 @@ import { computeAudioPeaks, getCanvasDimensions, nextId } from './utils/timecode
 import { splitClipAtOffset } from './utils/clipTime';
 import { exportProjectToMp4, type ExportProgress } from './utils/exporter';
 import { exportViaRustEngine, isRustBackendAvailable, uploadMediaToRust } from './utils/rustBridge';
-import { audibleClips, scheduleClipAudio } from './audio/scheduleClipAudio';
+import { ensureAssetAudio } from './audio/scheduleClipAudio';
+import { TimelineClock } from './audio/TimelineClock';
+import { AudioScheduler } from './audio/AudioScheduler';
 import { VideoSyncController } from './engine/VideoSyncController';
 import { detectCapabilities } from './utils/capabilities';
 import {
@@ -115,7 +117,9 @@ export function App() {
   const noiseFilterRef = useRef<BiquadFilterNode | null>(null);
   const compressorRef = useRef<DynamicsCompressorNode | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
-  const activeAudioSourcesRef = useRef<AudioBufferSourceNode[]>([]);
+  const playRequestIdRef = useRef(0);
+  const pendingPlayRef = useRef(false);
+  const vfcPaintedThisFrameRef = useRef(false);
 
   const micRecorderRef = useRef<MediaRecorder | null>(null);
   const micChunksRef = useRef<Blob[]>([]);
@@ -209,7 +213,25 @@ export function App() {
     setColors(next);
   }, []);
 
-  // Forward-declared so the video controller and WebCodecs decoder can request a redraw once a frame lands.
+  // Phase 2: Authoritative Master Clock anchored strictly to AudioContext.currentTime
+  const timelineClockRef = useRef<TimelineClock | null>(null);
+  const getTimelineClock = useCallback(() => {
+    if (!timelineClockRef.current) {
+      timelineClockRef.current = new TimelineClock();
+    }
+    return timelineClockRef.current;
+  }, []);
+
+  // Phase 2: Deterministic 150ms lookahead Web Audio scheduler
+  const audioSchedulerRef = useRef<AudioScheduler | null>(null);
+  const getAudioScheduler = useCallback(() => {
+    if (!audioSchedulerRef.current) {
+      audioSchedulerRef.current = new AudioScheduler(getTimelineClock());
+    }
+    return audioSchedulerRef.current;
+  }, [getTimelineClock]);
+
+  // Forward-declared so the video controller (rVFC / seeked) and WebCodecs decoder can trigger redraws.
   const drawNowRef = useRef<(time: number) => void>(() => {});
   const videoSyncRef = useRef<VideoSyncController | null>(null);
   const getVideoSync = useCallback(() => {
@@ -217,12 +239,19 @@ export function App() {
       videoSyncRef.current = new VideoSyncController(
         () => assetsMapRef.current,
         () => {
-          if (!isPlayingRef.current) drawNowRef.current(playheadRef.current);
+          if (isPlayingRef.current) {
+            const liveT = Math.min(getTimelineClock().getCurrentTime(), totalDurationRef.current);
+            playheadRef.current = liveT;
+            drawNowRef.current(liveT);
+            vfcPaintedThisFrameRef.current = true;
+          } else {
+            drawNowRef.current(playheadRef.current);
+          }
         }
       );
     }
     return videoSyncRef.current;
-  }, []);
+  }, [getTimelineClock]);
 
   const renderClientRef = useRef<RenderClient | null>(null);
   const getRenderClient = useCallback(() => {
@@ -238,22 +267,21 @@ export function App() {
     getVideoSync().setProxyMode(proxyMode);
   }, [getVideoSync, proxyMode]);
 
-  // Master playback clock: anchored to AudioContext time so picture follows sound exactly.
-  const clockRef = useRef({ timeline: 0, ctxTime: 0, perfTime: 0, useCtx: false });
-  const anchorClock = useCallback((timeline: number) => {
-    const ctx = audioCtxRef.current;
-    clockRef.current = {
-      timeline,
-      ctxTime: ctx?.currentTime ?? 0,
-      perfTime: performance.now(),
-      useCtx: Boolean(ctx && ctx.state === 'running'),
+  // Immediate audio, video, clock, and export cleanup on component unmount
+  useEffect(() => {
+    return () => {
+      playRequestIdRef.current += 1;
+      pendingPlayRef.current = false;
+      isPlayingRef.current = false;
+      timelineClockRef.current?.pause();
+      exportAbortRef.current?.abort();
+      audioSchedulerRef.current?.stopAll();
+      videoSyncRef.current?.reset();
+      renderClientRef.current?.reset();
+      if (audioCtxRef.current && audioCtxRef.current.state !== 'closed') {
+        audioCtxRef.current.close().catch(() => {});
+      }
     };
-  }, []);
-  const clockNow = useCallback(() => {
-    const c = clockRef.current;
-    const ctx = audioCtxRef.current;
-    if (c.useCtx && ctx && ctx.state === 'running') return c.timeline + (ctx.currentTime - c.ctxTime);
-    return c.timeline + (performance.now() - c.perfTime) / 1000;
   }, []);
 
   const drawNow = useCallback(
@@ -296,16 +324,8 @@ export function App() {
   }, [clips, colors, canvasDims, drawNow]);
 
   const stopAllAudio = useCallback(() => {
-    activeAudioSourcesRef.current.forEach((node) => {
-      try {
-        node.stop();
-        node.disconnect();
-      } catch {
-        // ignore
-      }
-    });
-    activeAudioSourcesRef.current = [];
-  }, []);
+    getAudioScheduler().stopAll();
+  }, [getAudioScheduler]);
 
   const ensureAudioCtx = useCallback(() => {
     if (!audioCtxRef.current) {
@@ -334,11 +354,12 @@ export function App() {
       compressorRef.current = comp;
       analyserRef.current = analyser;
     }
+    getTimelineClock().attach(audioCtxRef.current);
     if (audioCtxRef.current.state === 'suspended') {
       audioCtxRef.current.resume().catch(() => {});
     }
     return audioCtxRef.current;
-  }, []);
+  }, [getTimelineClock]);
 
   useEffect(() => {
     if (noiseFilterRef.current) {
@@ -347,34 +368,46 @@ export function App() {
   }, [colors.noiseReduce]);
 
   const startAudioAt = useCallback(
-    (timeSec: number) => {
-      stopAllAudio();
+    (reanchorSec?: number) => {
       const ctx = audioCtxRef.current;
-      if (!ctx) return;
-
-      const allClips = clipsRef.current;
-      const dest = masterGainRef.current || ctx.destination;
-      const when = ctx.currentTime;
-
-      for (const [clip, buffer] of audibleClips(allClips, assetsMapRef.current)) {
-        const node = scheduleClipAudio({
-          ctx,
-          destination: dest,
-          clip,
-          buffer,
-          playFrom: timeSec,
-          when,
-          allClips,
-        });
-        if (node) activeAudioSourcesRef.current.push(node);
+      if (!ctx || ctx.state !== 'running') return;
+      getTimelineClock().attach(ctx);
+      if (reanchorSec !== undefined) {
+        getTimelineClock().seek(reanchorSec);
       }
+      getAudioScheduler().restart(
+        ctx,
+        masterGainRef.current || ctx.destination,
+        clipsRef.current,
+        assetsMapRef.current
+      );
     },
-    [stopAllAudio]
+    [getAudioScheduler, getTimelineClock]
   );
+
+  /** Seamlessly schedule newly decoded audio assets without cutting already-playing tracks. */
+  const pumpAudio = useCallback(() => {
+    const ctx = audioCtxRef.current;
+    if (!ctx || ctx.state !== 'running' || !isPlayingRef.current) return;
+    getAudioScheduler().pump(
+      ctx,
+      masterGainRef.current || ctx.destination,
+      clipsRef.current,
+      assetsMapRef.current
+    );
+  }, [getAudioScheduler]);
 
   const syncVideoElements = useCallback(
     (time: number, forceSeek: boolean) => {
-      getVideoSync().sync(time, clipsRef.current, isPlayingRef.current, forceSeek);
+      const sync = getVideoSync();
+      // Phase 2 Guardrails: Always mute <video> so all audio runs exclusively through Web Audio,
+      // and slave video drift to the AudioContext Master Clock with a strict 80ms threshold.
+      const syncOpts = { driftThresholdSec: 0.08, alwaysMuteVideo: true };
+      if (forceSeek) {
+        sync.seekDiscrete(time, clipsRef.current, isPlayingRef.current, syncOpts);
+      } else {
+        sync.updatePlayback(time, clipsRef.current, syncOpts);
+      }
     },
     [getVideoSync]
   );
@@ -384,63 +417,137 @@ export function App() {
       const clamped = Math.max(0, Math.min(time, totalDurationRef.current));
       playheadRef.current = clamped;
       setPlayhead(clamped);
-      anchorClock(clamped);
+      getTimelineClock().seek(clamped);
+      stopAllAudio();
       syncVideoElements(clamped, true);
-      if (isPlayingRef.current) startAudioAt(clamped);
+      if (isPlayingRef.current) startAudioAt();
       drawNow(clamped);
     },
-    [anchorClock, drawNow, startAudioAt, syncVideoElements]
+    [drawNow, getTimelineClock, startAudioAt, stopAllAudio, syncVideoElements]
   );
 
   const togglePlay = useCallback(
     (force?: boolean) => {
-      ensureAudioCtx();
       const total = totalDurationRef.current;
-      if (total <= 0) {
-        showToast('กรุณาเพิ่มคลิปลงไทม์ไลน์ก่อนเล่นครับ');
-        return;
-      }
-      const next = force !== undefined ? force : !isPlayingRef.current;
-      if (next && playheadRef.current >= total) {
-        playheadRef.current = 0;
-        setPlayhead(0);
-      }
-      isPlayingRef.current = next;
-      setIsPlaying(next);
+      const next = force !== undefined ? force : !(isPlayingRef.current || pendingPlayRef.current);
+      const reqId = ++playRequestIdRef.current;
 
-      if (next) {
-        anchorClock(playheadRef.current);
-        syncVideoElements(playheadRef.current, true);
-        startAudioAt(playheadRef.current);
-      } else {
+      // Always execute pause/stop BEFORE checking totalDuration so deleting/undoing the last clip
+      // during active playback cleanly halts playback instead of looping forever.
+      if (!next) {
+        pendingPlayRef.current = false;
+        const frozen = getTimelineClock().pause();
+        isPlayingRef.current = false;
+        setIsPlaying(false);
+        const clampedFrozen = Math.max(0, Math.min(frozen, total));
+        playheadRef.current = clampedFrozen;
+        setPlayhead(clampedFrozen);
         getVideoSync().pauseAll();
         stopAllAudio();
         setAudioDb('-∞ dB');
+        return;
+      }
+
+      if (total <= 0) {
+        pendingPlayRef.current = false;
+        showToast('กรุณาเพิ่มคลิปลงไทม์ไลน์ก่อนเล่นครับ');
+        return;
+      }
+
+      const ctx = ensureAudioCtx();
+      if (playheadRef.current >= total) {
+        playheadRef.current = 0;
+        setPlayhead(0);
+      }
+      pendingPlayRef.current = true;
+
+      const startPlayback = () => {
+        if (playRequestIdRef.current !== reqId || ctx.state === 'closed') {
+          if (playRequestIdRef.current === reqId) pendingPlayRef.current = false;
+          return;
+        }
+        pendingPlayRef.current = false;
+        if (totalDurationRef.current <= 0) return;
+        if (ctx.state !== 'running') {
+          showToast('ไม่สามารถเปิดระบบเสียง (AudioContext) ได้ กรุณากดเล่นอีกครั้ง');
+          return;
+        }
+
+        const startPos = Math.min(playheadRef.current, totalDurationRef.current);
+        playheadRef.current = startPos;
+        isPlayingRef.current = true;
+        setIsPlaying(true);
+        vfcPaintedThisFrameRef.current = false;
+        getTimelineClock().attach(ctx);
+        getTimelineClock().start(startPos);
+        syncVideoElements(startPos, true);
+        getAudioScheduler().restart(
+          ctx,
+          masterGainRef.current || ctx.destination,
+          clipsRef.current,
+          assetsMapRef.current
+        );
+        // Ensure any un-decoded audio/video asset decodes into AudioBuffer and joins lookahead pump
+        assetsMapRef.current.forEach((asset) => {
+          if ((asset.type === 'video' || asset.type === 'audio') && !asset.audioBuffer && asset.audioStatus !== 'none') {
+            ensureAssetAudio(asset, ctx).then((buf) => {
+              if (!buf || !isPlayingRef.current || ctx.state !== 'running') return;
+              getAudioScheduler().pump(
+                ctx,
+                masterGainRef.current || ctx.destination,
+                clipsRef.current,
+                assetsMapRef.current
+              );
+            });
+          }
+        });
+      };
+
+      if (ctx.state === 'suspended') {
+        ctx
+          .resume()
+          .then(startPlayback)
+          .catch(() => {
+            if (playRequestIdRef.current === reqId) {
+              pendingPlayRef.current = false;
+              showToast('ไม่สามารถเปิดระบบเสียง (AudioContext) ได้ กรุณากดเล่นอีกครั้ง');
+            }
+          });
+      } else {
+        startPlayback();
       }
     },
-    [anchorClock, ensureAudioCtx, getVideoSync, showToast, startAudioAt, stopAllAudio, syncVideoElements]
+    [ensureAudioCtx, getAudioScheduler, getTimelineClock, getVideoSync, showToast, stopAllAudio, syncVideoElements]
   );
 
-  // Playback rAF Loop driven by master AudioContext clock
+  // Playback rAF Loop driven exclusively by the AudioContext Master Clock (TimelineClock)
   useEffect(() => {
     let rafId = 0;
     let fpsCounter = 0;
-    let fpsTimer = performance.now();
-    let dbTimer = performance.now();
-    let uiPlayheadTimer = performance.now();
+    let fpsTimer = 0;
+    let dbTimer = 0;
+    let uiPlayheadTimer = 0;
     const dbData = new Uint8Array(128);
 
     const tick = (now: number) => {
+      if (fpsTimer === 0) {
+        fpsTimer = now;
+        dbTimer = now;
+        uiPlayheadTimer = now;
+      }
+
       if (isPlayingRef.current) {
-        let nextTime = clockNow();
+        const clock = getTimelineClock();
+        let nextTime = clock.getCurrentTime();
         const total = totalDurationRef.current;
 
         if (nextTime >= total) {
+          vfcPaintedThisFrameRef.current = false;
           if (loopRef.current && total > 0) {
             nextTime = 0;
             playheadRef.current = 0;
             setPlayhead(0);
-            anchorClock(0);
+            clock.start(0);
             syncVideoElements(0, true);
             startAudioAt(0);
           } else {
@@ -451,7 +558,16 @@ export function App() {
           }
         } else {
           playheadRef.current = nextTime;
-          // Throttle React state updates to ~30Hz while rendering canvas at full 60-120Hz
+          // Pump the deterministic 150ms Web Audio lookahead scheduler
+          if (audioCtxRef.current && audioCtxRef.current.state === 'running') {
+            getAudioScheduler().pump(
+              audioCtxRef.current,
+              masterGainRef.current || audioCtxRef.current.destination,
+              clipsRef.current,
+              assetsMapRef.current
+            );
+          }
+          // Throttle React state updates to ~30Hz while canvas updates via rVFC/rAF at full refresh rate
           if (now - uiPlayheadTimer >= 32) {
             setPlayhead(nextTime);
             uiPlayheadTimer = now;
@@ -459,7 +575,13 @@ export function App() {
           syncVideoElements(nextTime, false);
         }
 
-        drawNow(playheadRef.current);
+        // Coalesce with rVFC: skip duplicate composite if rVFC already drew this paint frame
+        if (vfcPaintedThisFrameRef.current) {
+          vfcPaintedThisFrameRef.current = false;
+        } else {
+          drawNow(playheadRef.current);
+        }
+
         fpsCounter++;
         if (now - fpsTimer >= 500) {
           setLiveFps(Math.round((fpsCounter * 1000) / (now - fpsTimer)));
@@ -484,7 +606,7 @@ export function App() {
 
     rafId = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(rafId);
-  }, [anchorClock, clockNow, drawNow, startAudioAt, syncVideoElements, togglePlay]);
+  }, [drawNow, getAudioScheduler, getTimelineClock, startAudioAt, syncVideoElements, togglePlay]);
 
   // Fast Zero-Copy File Import (no IndexedDB blob blocking!)
   const addAssetToTimeline = useCallback(
@@ -621,7 +743,7 @@ export function App() {
               setAssets((prev) => prev.map((a) => (a.id === readyAsset.id ? { ...readyAsset } : a)));
               if (isPlayingRef.current) {
                 if (readyAsset.type === 'video') syncVideoElements(playheadRef.current, false);
-                startAudioAt(playheadRef.current);
+                pumpAudio();
               }
             },
           });
@@ -644,7 +766,7 @@ export function App() {
         }
       }
     },
-    [addAssetToTimeline, attachVideoEnhancements, ensureAudioCtx, showToast, startAudioAt, syncVideoElements]
+    [addAssetToTimeline, attachVideoEnhancements, ensureAudioCtx, pumpAudio, showToast, syncVideoElements]
   );
 
   const handleRestoreRecovery = useCallback(async () => {
@@ -664,6 +786,7 @@ export function App() {
             onAudioReady: (readyAsset) => {
               if (!assetsMapRef.current.has(readyAsset.id)) return;
               setAssets((prev) => prev.map((a) => (a.id === readyAsset.id ? { ...readyAsset } : a)));
+              pumpAudio();
             },
           });
           assetsMapRef.current.set(asset.id, asset);
@@ -687,7 +810,7 @@ export function App() {
     } finally {
       setIsRestoringRecovery(false);
     }
-  }, [attachVideoEnhancements, commitClips, ensureAudioCtx, handleUpdateColors, recoveryCandidate, showToast]);
+  }, [attachVideoEnhancements, commitClips, ensureAudioCtx, handleUpdateColors, pumpAudio, recoveryCandidate, showToast]);
 
   const handleDiscardRecovery = useCallback(async () => {
     setRecoveryCandidate(null);
@@ -763,7 +886,7 @@ export function App() {
           'normalizeGain' in patch ||
           'audioKeyframes' in patch)
       ) {
-        startAudioAt(playheadRef.current);
+        startAudioAt();
       }
     },
     [commitClips, pushHistory, startAudioAt]
@@ -789,7 +912,7 @@ export function App() {
     const next = [...clipsRef.current.filter((c) => c.id !== target.id), leftClip, rightClip];
     commitClips(next);
     setSelectedClipId(rightClip.id);
-    if (isPlayingRef.current) startAudioAt(playheadRef.current);
+    if (isPlayingRef.current) startAudioAt();
     showToast('ตัดแบ่งคลิปแล้ว');
   }, [commitClips, pushHistory, selectedClipId, showToast, startAudioAt]);
 
@@ -799,7 +922,7 @@ export function App() {
     const next = clipsRef.current.filter((c) => c.id !== selectedClipId);
     commitClips(next);
     setSelectedClipId(null);
-    if (isPlayingRef.current) startAudioAt(playheadRef.current);
+    if (isPlayingRef.current) startAudioAt();
   }, [commitClips, pushHistory, selectedClipId, startAudioAt]);
 
   const handleRippleDelete = useCallback(() => {
@@ -817,7 +940,7 @@ export function App() {
       );
     commitClips(next);
     setSelectedClipId(null);
-    if (isPlayingRef.current) startAudioAt(playheadRef.current);
+    if (isPlayingRef.current) startAudioAt();
     showToast('ลบและเลื่อนคลิปมาชิดกันแล้ว');
   }, [commitClips, pushHistory, selectedClipId, showToast, startAudioAt]);
 
@@ -833,7 +956,7 @@ export function App() {
     setHistory(nextHist);
     setRedoStack(nextRedo);
     commitClips(last);
-    if (isPlayingRef.current) startAudioAt(playheadRef.current);
+    if (isPlayingRef.current) startAudioAt();
   }, [commitClips, startAudioAt]);
 
   const handleRedo = useCallback(() => {
@@ -848,11 +971,12 @@ export function App() {
     setRedoStack(nextRedo);
     setHistory(nextHist);
     commitClips(next);
-    if (isPlayingRef.current) startAudioAt(playheadRef.current);
+    if (isPlayingRef.current) startAudioAt();
   }, [commitClips, startAudioAt]);
 
   const handleClearProject = useCallback(() => {
-    if (isPlayingRef.current) togglePlay(false);
+    togglePlay(false);
+    stopAllAudio();
     videoSyncRef.current?.reset();
     renderClientRef.current?.reset();
     assetsMapRef.current.forEach((a) => {
@@ -870,7 +994,7 @@ export function App() {
     void clearAllRecoveryData();
     seekTo(0);
     showToast('เริ่มโปรเจกต์ใหม่แล้ว');
-  }, [commitClips, seekTo, showToast, togglePlay]);
+  }, [commitClips, seekTo, showToast, stopAllAudio, togglePlay]);
 
   // Global Keyboard Shortcuts
   useEffect(() => {
@@ -900,7 +1024,7 @@ export function App() {
   // Export Handler (120 FPS WebCodecs Streaming Engine)
   const handleStartExport = async () => {
     if (totalDuration <= 0) return;
-    if (isPlayingRef.current) togglePlay(false);
+    togglePlay(false);
 
     setIsExporting(true);
     setExportError(null);
@@ -973,6 +1097,7 @@ export function App() {
     } finally {
       setIsExporting(false);
       exportAbortRef.current = null;
+      syncVideoElements(playheadRef.current, true);
       drawNow(playheadRef.current);
     }
   };
@@ -1175,13 +1300,14 @@ export function App() {
           ...clipsRef.current.map((c) => (c.id === clipId ? { ...c, muted: true } : c)),
           audioClip,
         ]);
+        if (isPlayingRef.current) startAudioAt();
         setSelectedClipId(audioClip.id);
         showToast('แยกเสียงลงแทร็กเสียงแล้ว');
       } catch {
         showToast('วิดีโอนี้ไม่มีแทร็กเสียง หรือเบราว์เซอร์ไม่รองรับการถอดรหัส');
       }
     },
-    [commitClips, ensureAudioCtx, pushHistory, showToast]
+    [commitClips, ensureAudioCtx, pushHistory, showToast, startAudioAt]
   );
 
   // --- Mic Voiceover Recording ---
@@ -1361,6 +1487,7 @@ export function App() {
     async (file: File) => {
       try {
         const data = JSON.parse(await file.text());
+        togglePlay(false);
         if (data.aspectRatio) setAspectRatio(data.aspectRatio);
         if (data.colors) handleUpdateColors({ ...DEFAULT_COLORS, ...data.colors });
         if (data.exportSettings) setExportSettings(data.exportSettings);
@@ -1377,13 +1504,14 @@ export function App() {
             mediaId: c.mediaId ? idMap.get(c.mediaId) ?? c.mediaId : null,
           }));
           commitClips(restored);
+          seekTo(0);
           showToast('โหลดโปรเจกต์ .JSON แล้ว (นำเข้าไฟล์สื่อชื่อเดิมหากคลิปยังไม่ขึ้น)');
         }
       } catch {
         showToast('ไฟล์โปรเจกต์ .JSON ไม่ถูกต้อง');
       }
     },
-    [assets, commitClips, handleUpdateColors, pushHistory, showToast]
+    [assets, commitClips, handleUpdateColors, pushHistory, seekTo, showToast, togglePlay]
   );
 
   const handleExportFcpxml = useCallback(() => {
@@ -1434,23 +1562,35 @@ export function App() {
       importFiles: handleImportFiles,
       importProject: handleImportProject,
       exportMp4: async () => {
-        const res = await exportProjectToMp4({
-          clips: clipsRef.current,
-          assets: assetsMapRef.current,
-          colors: colorsRef.current,
-          aspectRatio,
-          settings: exportSettings,
-          totalDuration: Math.max(0.5, totalDurationRef.current),
-          signal: new AbortController().signal,
-          onProgress: () => {},
-          decodeFrame: (asset, srcT) => getRenderClient().decodeFrameForExport(asset, srcT),
-        });
-        return { blob: res.blob, filename: res.filename };
+        togglePlay(false);
+        try {
+          const res = await exportProjectToMp4({
+            clips: clipsRef.current,
+            assets: assetsMapRef.current,
+            colors: colorsRef.current,
+            aspectRatio,
+            settings: exportSettings,
+            totalDuration: Math.max(0.5, totalDurationRef.current),
+            signal: new AbortController().signal,
+            onProgress: () => {},
+            decodeFrame: (asset, srcT) => getRenderClient().decodeFrameForExport(asset, srcT),
+          });
+          if (res.cleanup) {
+            const bytes = await res.blob.arrayBuffer();
+            await res.cleanup().catch(() => {});
+            return { blob: new Blob([bytes], { type: 'video/mp4' }), filename: res.filename };
+          }
+          return { blob: res.blob, filename: res.filename };
+        } finally {
+          syncVideoElements(playheadRef.current, true);
+          drawNow(playheadRef.current);
+        }
       },
     });
   }, [
     aspectRatio,
     capabilities,
+    drawNow,
     exportSettings,
     getRenderClient,
     handleAddTextClip,
@@ -1464,6 +1604,7 @@ export function App() {
     handleUndo,
     handleUpdateColors,
     seekTo,
+    syncVideoElements,
     togglePlay,
   ]);
 
@@ -1718,11 +1859,12 @@ export function App() {
         return c;
       });
       commitClips([...clipsRef.current.filter((c) => c.id !== audioClip.id), ...newClips]);
+      if (isPlayingRef.current) startAudioAt();
       appendAiLog(`ตัดช่วงเงียบออกแล้ว เหลือ ${newClips.length} ท่อน`);
       showToast(`ตัดช่วงเงียบสำเร็จ (${newClips.length} ท่อน)`);
     };
     worker.postMessage({ samples: chData, sampleRate: sr }, [chData.buffer]);
-  }, [appendAiLog, commitClips, pushHistory, selectedClipId, showToast]);
+  }, [appendAiLog, commitClips, pushHistory, selectedClipId, showToast, startAudioAt]);
 
   const handleAiSplitHalf = useCallback(() => {
     const target =
@@ -1736,9 +1878,10 @@ export function App() {
     const half = target.duration / 2;
     const [left, right] = splitClipAtOffset(target, half, nextId('clip'));
     commitClips([...clipsRef.current.filter((c) => c.id !== target.id), left, right]);
+    if (isPlayingRef.current) startAudioAt();
     appendAiLog(`แบ่งครึ่งคลิป "${target.name}" แล้ว`);
     showToast('แบ่งครึ่งคลิปวิดีโอแล้ว');
-  }, [appendAiLog, commitClips, pushHistory, selectedClipId, showToast]);
+  }, [appendAiLog, commitClips, pushHistory, selectedClipId, showToast, startAudioAt]);
 
   const handleAiAutoShorts = useCallback(() => {
     setAspectRatio('9:16');

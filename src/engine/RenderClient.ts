@@ -1,24 +1,56 @@
 import type { ColorSettings, MediaAsset, TimelineClip } from '../types/editor';
-import { renderCompositionFrame, type RenderOptions } from '../utils/renderer';
+import {
+  type Canvas2DContext,
+  isVideoFrameReady,
+  renderCompositionFrame,
+  type RenderOptions,
+} from '../utils/renderer';
 import { getSharedGpuCompositor } from '../filmcraft/gpuCompositor';
 import { WcSource } from '../filmcraft/webcodecs';
 import { clipSourceTime, findActiveClip } from '../utils/clipTime';
 
 /**
- * Unified FilmCraft Render & WebCodecs Decode Coordinator.
+ * Unified Flicker-Free Double-Buffered Render & WebCodecs Decode Coordinator.
  *
- * - Manages per-asset `WcSource` (FilmCraft GOP-aware WebCodecs `VideoDecoder` + 40-frame LRU cache)
- *   for frame-accurate scrubbing and offline export without 180ms `<video>` seek timeouts.
- * - Uses `FilmCraftGpuCompositor` (WebGL2 linear-light shaders) when available, with automatic
- *   fallback to `renderCompositionFrame` (Canvas 2D) when `?cpu` is set or WebGL2 is unavailable.
+ * Phase 1 Guardrails:
+ * - Double-buffers every frame onto an OffscreenCanvas (with HTMLCanvasElement fallback)
+ *   before performing a single atomic blit onto the visible preview <canvas>.
+ * - NEVER clears or wipes the visible <canvas> before verifying that the active video frame
+ *   is ready (`video.readyState >= 2 && !video.seeking`) or a decoded WebCodecs frame exists.
+ * - Retains the previous valid frame on the visible <canvas> during clip transitions/seeks.
  */
 export class RenderClient {
   private wcSources = new Map<string, WcSource>();
   private openingIds = new Set<string>();
+  private backbuffer: OffscreenCanvas | HTMLCanvasElement | null = null;
+  private backbufferCtx: Canvas2DContext | null = null;
   private readonly onRepaint: () => void;
 
   constructor(onRepaint: () => void) {
     this.onRepaint = onRepaint;
+  }
+
+  private ensureBackbuffer(width: number, height: number): [OffscreenCanvas | HTMLCanvasElement, Canvas2DContext] | null {
+    const w = Math.max(2, width);
+    const h = Math.max(2, height);
+    if (!this.backbuffer) {
+      if (typeof OffscreenCanvas !== 'undefined') {
+        this.backbuffer = new OffscreenCanvas(w, h);
+      } else if (typeof document !== 'undefined') {
+        const c = document.createElement('canvas');
+        c.width = w;
+        c.height = h;
+        this.backbuffer = c;
+      } else {
+        return null;
+      }
+      this.backbufferCtx = this.backbuffer.getContext('2d', { alpha: false }) as Canvas2DContext | null;
+    } else if (this.backbuffer.width !== w || this.backbuffer.height !== h) {
+      this.backbuffer.width = w;
+      this.backbuffer.height = h;
+    }
+    if (!this.backbufferCtx) return null;
+    return [this.backbuffer, this.backbufferCtx];
   }
 
   /** Register a video asset with the FilmCraft WebCodecs GOP decoder in the background. */
@@ -39,7 +71,7 @@ export class RenderClient {
       });
   }
 
-  /** Decode a video asset's frame at `srcTimeSec` using WebCodecs `WcSource` (for frame-accurate export). */
+  /** Decode a video asset's frame at `srcTimeSec` using WebCodecs `WcSource` (for frame-accurate export or reverse playback). */
   async decodeFrameForExport(asset: MediaAsset, srcTimeSec: number): Promise<CanvasImageSource | null> {
     let src = this.wcSources.get(asset.id);
     if (!src && !this.openingIds.has(asset.id)) {
@@ -61,9 +93,9 @@ export class RenderClient {
   }
 
   /**
-   * Render a composition frame at `time`.
-   * While scrubbing (`!isPlaying`), checks the FilmCraft `WcSource` decoded-frame cache first
-   * for zero-flicker frame-accurate scrubbing, falling back to the double-buffered `<video>` element.
+   * Double-buffered flicker-free render at timeline timestamp `time`.
+   * Composes onto an OffscreenCanvas backbuffer first and blits atomically to the visible
+   * canvas ONLY when the active video frame is verified ready (`readyState >= 2 && !seeking`).
    */
   render(params: {
     ctx: CanvasRenderingContext2D;
@@ -90,15 +122,38 @@ export class RenderClient {
       videoSource,
     } = params;
 
-    let cachedBitmap: ImageBitmap | null = null;
     const activeVideo = findActiveClip(clips, 'video', time);
-    if (!isPlaying && activeVideo?.mediaId) {
+    const videoAsset = activeVideo?.mediaId ? assets.get(activeVideo.mediaId) : undefined;
+
+    // Use WebCodecs cached frame when scrubbing OR playing a reversed clip (no video.currentTime spam!)
+    let cachedBitmap: ImageBitmap | null = null;
+    let waitingForReverseWcFrame = false;
+    if (activeVideo?.mediaId && (!isPlaying || activeVideo.reverse)) {
       const wc = this.wcSources.get(activeVideo.mediaId);
       if (wc && !wc.isFailed()) {
         const srcT = clipSourceTime(activeVideo, time);
         cachedBitmap = wc.getCachedOrRequestFrame(srcT);
+        if (isPlaying && activeVideo.reverse && !cachedBitmap) {
+          waitingForReverseWcFrame = true;
+        }
       }
     }
+
+    // Phase 1 Strict Guardrail: NEVER clear or touch the visible canvas unless the active video
+    // frame is ready (`readyState >= 2 && !seeking`) or we have a decoded WebCodecs frame.
+    // During reverse playback with an active WebCodecs decoder, hold the previous valid frame on
+    // cache miss instead of flashing back to the parked HTMLVideoElement entry frame.
+    if (waitingForReverseWcFrame) {
+      return false;
+    }
+    const videoEl = activeVideo && !cachedBitmap ? videoSource(activeVideo) ?? videoAsset?.videoEl : undefined;
+    if (activeVideo && videoAsset && !cachedBitmap && !isVideoFrameReady(videoEl)) {
+      return false;
+    }
+
+    const bb = this.ensureBackbuffer(width, height);
+    if (!bb) return false;
+    const [backbuffer, backCtx] = bb;
 
     const opts: RenderOptions = {
       videoSource,
@@ -109,10 +164,17 @@ export class RenderClient {
     };
 
     const gpu = getSharedGpuCompositor();
-    if (gpu) {
-      return gpu.renderFrame(ctx, width, height, time, clips, assets, colors, showCenterGuides, opts);
+    const drawn = gpu
+      ? gpu.renderFrame(backCtx, width, height, time, clips, assets, colors, showCenterGuides, opts)
+      : renderCompositionFrame(backCtx, width, height, time, clips, assets, colors, showCenterGuides, opts);
+
+    if (!drawn) {
+      return false;
     }
-    return renderCompositionFrame(ctx, width, height, time, clips, assets, colors, showCenterGuides, opts);
+
+    // Single atomic blit from OffscreenCanvas backbuffer to the visible preview <canvas>
+    ctx.drawImage(backbuffer, 0, 0, width, height);
+    return true;
   }
 
   reset(): void {
