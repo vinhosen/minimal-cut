@@ -44,7 +44,7 @@ export const TopBar: React.FC<TopBarProps> = ({
       ].join(' • ')
     : webCodecsSupported
       ? 'พร้อม Export 120 FPS แบบ Offline'
-      : 'ใช้ MediaRecorder';
+      : 'ต้องใช้เบราว์เซอร์ที่รองรับ WebCodecs';
 
   return (
     <header className="topbar">
@@ -63,7 +63,7 @@ export const TopBar: React.FC<TopBarProps> = ({
               ? capabilities?.webgl2
                 ? 'FilmCraft GPU + WebCodecs'
                 : 'WebCodecs พร้อมใช้'
-              : 'โหมดมาตรฐาน'}
+              : 'ไม่รองรับ WebCodecs'}
           </span>
         </div>
         {autosaveLabel && (

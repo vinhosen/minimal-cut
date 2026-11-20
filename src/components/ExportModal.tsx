@@ -152,7 +152,8 @@ export const ExportModal: React.FC<ExportModalProps> = ({
               <div>
                 <div style={{ fontWeight: 600, fontSize: 13 }}>บันทึกไฟล์สำเร็จ!</div>
                 <div style={{ fontSize: 11 }}>
-                  {doneInfo.filename} ({doneInfo.sizeMb} MB • {doneInfo.engine === 'webcodecs' ? 'WebCodecs MP4' : 'MediaRecorder'})
+                  {doneInfo.filename} ({doneInfo.sizeMb} MB •{' '}
+                  {doneInfo.engine === 'rust-ffmpeg' ? 'Rust FFmpeg MP4' : 'WebCodecs Offline MP4'})
                 </div>
               </div>
             </div>

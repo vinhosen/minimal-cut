@@ -1041,6 +1041,7 @@ export function App() {
     } finally {
       setIsExporting(false);
       exportAbortRef.current = null;
+      syncVideoElements(playheadRef.current, true);
       drawNow(playheadRef.current);
     }
   };
