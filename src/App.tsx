@@ -11,6 +11,8 @@ import { computeAudioPeaks, getCanvasDimensions, nextId } from './utils/timecode
 import { renderCompositionFrame } from './utils/renderer';
 import { exportProjectToMp4, type ExportProgress } from './utils/exporter';
 import { exportViaRustEngine, isRustBackendAvailable, uploadMediaToRust } from './utils/rustBridge';
+import { audibleClips, ensureAssetAudio, scheduleClipAudio } from './audio/scheduleClipAudio';
+import { VideoSyncController } from './engine/VideoSyncController';
 import { Film, FolderPlus, SlidersHorizontal } from 'lucide-react';
 import { TopBar } from './components/TopBar';
 import { MediaSidebar } from './components/MediaSidebar';
@@ -40,24 +42,22 @@ const DEFAULT_EXPORT: ExportSettings = {
 export function App() {
   const [assets, setAssets] = useState<MediaAsset[]>([]);
   const assetsMapRef = useRef<Map<string, MediaAsset>>(new Map());
+  const assetsMap = useMemo(() => new Map(assets.map((a) => [a.id, a])), [assets]);
 
   const [clips, setClips] = useState<TimelineClip[]>([]);
   const clipsRef = useRef<TimelineClip[]>([]);
-  clipsRef.current = clips;
 
   const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
   const [aspectRatio, setAspectRatio] = useState<AspectRatio>('16:9');
   const [proxyMode, setProxyMode] = useState(false);
   const [colors, setColors] = useState<ColorSettings>(DEFAULT_COLORS);
   const colorsRef = useRef<ColorSettings>(colors);
-  colorsRef.current = colors;
 
   const [exportSettings, setExportSettings] = useState<ExportSettings>(DEFAULT_EXPORT);
   const [zoom, setZoom] = useState(70);
   const [snap, setSnap] = useState(true);
   const [loop, setLoop] = useState(false);
   const loopRef = useRef(loop);
-  loopRef.current = loop;
 
   const [playhead, setPlayhead] = useState(0);
   const playheadRef = useRef(0);
@@ -126,7 +126,6 @@ export function App() {
     [clips]
   );
   const totalDurationRef = useRef(0);
-  totalDurationRef.current = totalDuration;
 
   const selectedClip = useMemo(
     () => clips.find((c) => c.id === selectedClipId) || null,
@@ -138,9 +137,48 @@ export function App() {
     setTimeout(() => setToast((prev) => (prev === msg ? null : prev)), 2800);
   }, []);
 
+  const historyRef = useRef<TimelineClip[][]>([]);
+  const redoStackRef = useRef<TimelineClip[][]>([]);
+
   const pushHistory = useCallback((snapshot: TimelineClip[]) => {
-    setHistory((prev) => [...prev.slice(-29), snapshot.map((c) => ({ ...c }))]);
+    const next = [...historyRef.current.slice(-29), snapshot.map((c) => ({ ...c }))];
+    historyRef.current = next;
+    redoStackRef.current = [];
+    setHistory(next);
     setRedoStack([]);
+  }, []);
+
+  // Forward-declared so the video controller can request a redraw once a seek lands.
+  const drawNowRef = useRef<(time: number) => void>(() => {});
+  const videoSyncRef = useRef<VideoSyncController | null>(null);
+  const getVideoSync = useCallback(() => {
+    if (!videoSyncRef.current) {
+      videoSyncRef.current = new VideoSyncController(
+        () => assetsMapRef.current,
+        () => {
+          if (!isPlayingRef.current) drawNowRef.current(playheadRef.current);
+        }
+      );
+    }
+    return videoSyncRef.current;
+  }, []);
+
+  // Master playback clock: anchored to AudioContext time so picture follows sound exactly.
+  const clockRef = useRef({ timeline: 0, ctxTime: 0, perfTime: 0, useCtx: false });
+  const anchorClock = useCallback((timeline: number) => {
+    const ctx = audioCtxRef.current;
+    clockRef.current = {
+      timeline,
+      ctxTime: ctx?.currentTime ?? 0,
+      perfTime: performance.now(),
+      useCtx: Boolean(ctx && ctx.state === 'running'),
+    };
+  }, []);
+  const clockNow = useCallback(() => {
+    const c = clockRef.current;
+    const ctx = audioCtxRef.current;
+    if (c.useCtx && ctx && ctx.state === 'running') return c.timeline + (ctx.currentTime - c.ctxTime);
+    return c.timeline + (performance.now() - c.perfTime) / 1000;
   }, []);
 
   const drawNow = useCallback(
@@ -149,6 +187,7 @@ export function App() {
       if (!canvas) return;
       const ctx = canvas.getContext('2d', { alpha: false });
       if (!ctx) return;
+      const sync = getVideoSync();
       renderCompositionFrame(
         ctx,
         canvas.width,
@@ -157,13 +196,27 @@ export function App() {
         clipsRef.current,
         assetsMapRef.current,
         colorsRef.current,
-        isDraggingPreviewRef.current
+        isDraggingPreviewRef.current,
+        // Hold the last good frame while a video is seeking instead of flashing black.
+        { videoSource: (clip) => sync.elementFor(clip), holdIfNotReady: true }
       );
     },
-    []
+    [getVideoSync]
   );
 
   useEffect(() => {
+    clipsRef.current = clips;
+    colorsRef.current = colors;
+    loopRef.current = loop;
+    totalDurationRef.current = totalDuration;
+    historyRef.current = history;
+    redoStackRef.current = redoStack;
+    drawNowRef.current = drawNow;
+  }, [clips, colors, loop, totalDuration, history, redoStack, drawNow]);
+
+  useEffect(() => {
+    clipsRef.current = clips;
+    colorsRef.current = colors;
     drawNow(playheadRef.current);
   }, [clips, colors, canvasDims, drawNow]);
 
@@ -224,105 +277,44 @@ export function App() {
       const ctx = audioCtxRef.current;
       if (!ctx) return;
 
-      for (const clip of clipsRef.current) {
-        if (clip.track !== 'audio' || !clip.mediaId) continue;
-        const asset = assetsMapRef.current.get(clip.mediaId);
-        if (!asset?.audioBuffer) continue;
-        if (timeSec >= clip.timelineStart + clip.duration) continue;
+      const allClips = clipsRef.current;
+      const dest = masterGainRef.current || ctx.destination;
+      const when = ctx.currentTime;
 
-        const src = ctx.createBufferSource();
-        src.buffer = asset.audioBuffer;
-        const gain = ctx.createGain();
-        const norm = clip.normalizeGain ?? 1;
-        const baseVol = (clip.muted ? 0 : (clip.volume ?? 100) / 100) * norm;
-        const now = ctx.currentTime;
-        const delay = Math.max(0, clip.timelineStart - timeSec);
-        const offset = Math.max(0, timeSec - clip.timelineStart);
-        const rem = clip.duration - offset;
-
-        gain.gain.setValueAtTime(baseVol, now + delay);
-        if (clip.fadeIn > 0 && offset < clip.fadeIn) {
-          gain.gain.setValueAtTime(0.001, now + delay);
-          gain.gain.linearRampToValueAtTime(baseVol, now + delay + (clip.fadeIn - offset));
-        }
-        if (clip.fadeOut > 0 && rem > 0.05) {
-          const outStart = Math.max(0, rem - clip.fadeOut);
-          gain.gain.setValueAtTime(baseVol, now + delay + outStart);
-          gain.gain.linearRampToValueAtTime(0.001, now + delay + rem);
-        }
-        if (clip.audioKeyframes?.length) {
-          const sorted = [...clip.audioKeyframes].sort((a, b) => a.t - b.t);
-          for (const kf of sorted) {
-            if (kf.t >= offset) {
-              gain.gain.linearRampToValueAtTime(Math.max(0.001, kf.gain * norm), now + delay + (kf.t - offset));
-            }
-          }
-        }
-
-        src.connect(gain);
-        gain.connect(masterGainRef.current || ctx.destination);
-        if (rem > 0.01) {
-          src.start(now + delay, clip.sourceStart + offset, rem);
-          activeAudioSourcesRef.current.push(src);
-        }
+      for (const [clip, buffer] of audibleClips(allClips, assetsMapRef.current)) {
+        const node = scheduleClipAudio({
+          ctx,
+          destination: dest,
+          clip,
+          buffer,
+          playFrom: timeSec,
+          when,
+          allClips,
+        });
+        if (node) activeAudioSourcesRef.current.push(node);
       }
     },
     [stopAllAudio]
   );
 
-  const syncVideoElements = useCallback((time: number, forceSeek: boolean) => {
-    const activeVideo = clipsRef.current.find(
-      (c) => c.track === 'video' && time >= c.timelineStart && time < c.timelineStart + c.duration
-    );
-
-    assetsMapRef.current.forEach((asset) => {
-      if (asset.type !== 'video' || !asset.videoEl) return;
-      const vid = asset.videoEl;
-      if (!activeVideo || activeVideo.mediaId !== asset.id) {
-        if (!vid.paused) vid.pause();
-        return;
-      }
-
-      const spd = activeVideo.speed || 1;
-      vid.playbackRate = spd;
-      vid.volume = activeVideo.muted ? 0 : Math.min(1, (activeVideo.volume ?? 100) / 100);
-      vid.muted = activeVideo.muted || activeVideo.reverse;
-
-      const localElapsed = time - activeVideo.timelineStart;
-      const tgt = activeVideo.reverse
-        ? activeVideo.sourceStart + Math.max(0, activeVideo.duration - localElapsed) * spd
-        : activeVideo.sourceStart + localElapsed * spd;
-
-      if (activeVideo.reverse) {
-        if (!vid.paused) vid.pause();
-        if (forceSeek || Math.abs(vid.currentTime - tgt) > 0.015) {
-          vid.currentTime = Math.max(0, Math.min(tgt, asset.duration));
-        }
-        return;
-      }
-
-      if (forceSeek || Math.abs(vid.currentTime - tgt) > 0.18) {
-        vid.currentTime = Math.max(0, Math.min(tgt, asset.duration));
-      }
-
-      if (isPlayingRef.current && vid.paused) {
-        vid.play().catch(() => {});
-      } else if (!isPlayingRef.current && !vid.paused) {
-        vid.pause();
-      }
-    });
-  }, []);
+  const syncVideoElements = useCallback(
+    (time: number, forceSeek: boolean) => {
+      getVideoSync().sync(time, clipsRef.current, isPlayingRef.current, forceSeek);
+    },
+    [getVideoSync]
+  );
 
   const seekTo = useCallback(
     (time: number) => {
       const clamped = Math.max(0, Math.min(time, totalDurationRef.current));
       playheadRef.current = clamped;
       setPlayhead(clamped);
+      anchorClock(clamped);
       syncVideoElements(clamped, true);
       if (isPlayingRef.current) startAudioAt(clamped);
       drawNow(clamped);
     },
-    [drawNow, startAudioAt, syncVideoElements]
+    [anchorClock, drawNow, startAudioAt, syncVideoElements]
   );
 
   const togglePlay = useCallback(
@@ -342,31 +334,30 @@ export function App() {
       setIsPlaying(next);
 
       if (next) {
+        anchorClock(playheadRef.current);
         syncVideoElements(playheadRef.current, true);
         startAudioAt(playheadRef.current);
       } else {
-        syncVideoElements(playheadRef.current, false);
+        getVideoSync().pauseAll();
         stopAllAudio();
         setAudioDb('-∞ dB');
       }
     },
-    [ensureAudioCtx, showToast, startAudioAt, stopAllAudio, syncVideoElements]
+    [anchorClock, ensureAudioCtx, getVideoSync, showToast, startAudioAt, stopAllAudio, syncVideoElements]
   );
 
-  // Playback rAF Loop
+  // Playback rAF Loop driven by master AudioContext clock
   useEffect(() => {
     let rafId = 0;
-    let lastTime = performance.now();
     let fpsCounter = 0;
     let fpsTimer = performance.now();
     let dbTimer = performance.now();
+    let uiPlayheadTimer = performance.now();
     const dbData = new Uint8Array(128);
 
     const tick = (now: number) => {
       if (isPlayingRef.current) {
-        const dt = Math.min((now - lastTime) / 1000, 0.1);
-        lastTime = now;
-        let nextTime = playheadRef.current + dt;
+        let nextTime = clockNow();
         const total = totalDurationRef.current;
 
         if (nextTime >= total) {
@@ -374,6 +365,7 @@ export function App() {
             nextTime = 0;
             playheadRef.current = 0;
             setPlayhead(0);
+            anchorClock(0);
             syncVideoElements(0, true);
             startAudioAt(0);
           } else {
@@ -384,7 +376,11 @@ export function App() {
           }
         } else {
           playheadRef.current = nextTime;
-          setPlayhead(nextTime);
+          // Throttle React state updates to ~30Hz while rendering canvas at full 60-120Hz
+          if (now - uiPlayheadTimer >= 32) {
+            setPlayhead(nextTime);
+            uiPlayheadTimer = now;
+          }
           syncVideoElements(nextTime, false);
         }
 
@@ -407,15 +403,13 @@ export function App() {
           setAudioDb(db <= -60 ? '-∞ dB' : `${db.toFixed(1)} dB`);
           dbTimer = now;
         }
-      } else {
-        lastTime = now;
       }
       rafId = requestAnimationFrame(tick);
     };
 
     rafId = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(rafId);
-  }, [drawNow, startAudioAt, syncVideoElements, togglePlay]);
+  }, [anchorClock, clockNow, drawNow, startAudioAt, syncVideoElements, togglePlay]);
 
   // Fast Zero-Copy File Import (no IndexedDB blob blocking!)
   const addAssetToTimeline = useCallback(
@@ -530,7 +524,7 @@ export function App() {
           const vid = document.createElement('video');
           vid.src = url;
           vid.playsInline = true;
-          vid.preload = 'metadata'; // Fast instant metadata load!
+          vid.preload = 'auto';
           vid.onloadedmetadata = () => {
             const asset: MediaAsset = {
               id: nextId('vid'),
@@ -552,6 +546,17 @@ export function App() {
                 if (sid) serverIdMapRef.current.set(asset.id, sid);
               });
             }
+            // Decode video audio track in background so preview and export use sample-accurate WebAudio
+            const ctx = ensureAudioCtx();
+            ensureAssetAudio(asset, ctx).then((buf) => {
+              if (!buf) return;
+              asset.peaks = computeAudioPeaks(buf);
+              setAssets((prev) => prev.map((a) => (a.id === asset.id ? { ...asset } : a)));
+              if (isPlayingRef.current) {
+                syncVideoElements(playheadRef.current, false);
+                startAudioAt(playheadRef.current);
+              }
+            });
           };
           vid.onerror = () => {
             URL.revokeObjectURL(url);
@@ -615,20 +620,17 @@ export function App() {
 
             // Decode AudioBuffer in background without blocking UI
             const ctx = ensureAudioCtx();
-            file
-              .arrayBuffer()
-              .then((ab) => ctx.decodeAudioData(ab))
-              .then((buf) => {
-                asset.audioBuffer = buf;
-                asset.peaks = computeAudioPeaks(buf);
-                setAssets((prev) => prev.map((a) => (a.id === asset.id ? { ...asset } : a)));
-              })
-              .catch(() => {});
+            ensureAssetAudio(asset, ctx).then((buf) => {
+              if (!buf) return;
+              asset.peaks = computeAudioPeaks(buf);
+              setAssets((prev) => prev.map((a) => (a.id === asset.id ? { ...asset } : a)));
+              if (isPlayingRef.current) startAudioAt(playheadRef.current);
+            });
           };
         }
       }
     },
-    [addAssetToTimeline, ensureAudioCtx, showToast]
+    [addAssetToTimeline, ensureAudioCtx, showToast, startAudioAt, syncVideoElements]
   );
 
   const handleAddTextClip = useCallback(
@@ -679,12 +681,31 @@ export function App() {
 
   const handleUpdateClip = useCallback(
     (id: string, patch: Partial<TimelineClip>, commitHistory = false) => {
-      setClips((prev) => {
-        if (commitHistory) pushHistory(prev);
-        return prev.map((c) => (c.id === id ? { ...c, ...patch } : c));
-      });
+      if (commitHistory) {
+        pushHistory(clipsRef.current);
+      }
+      const next = clipsRef.current.map((c) => (c.id === id ? { ...c, ...patch } : c));
+      clipsRef.current = next;
+      setClips(next);
+
+      if (
+        isPlayingRef.current &&
+        ('muted' in patch ||
+          'volume' in patch ||
+          'speed' in patch ||
+          'reverse' in patch ||
+          'fadeIn' in patch ||
+          'fadeOut' in patch ||
+          'timelineStart' in patch ||
+          'duration' in patch ||
+          'sourceStart' in patch ||
+          'normalizeGain' in patch ||
+          'audioKeyframes' in patch)
+      ) {
+        startAudioAt(playheadRef.current);
+      }
     },
-    [pushHistory]
+    [pushHistory, startAudioAt]
   );
 
   const handleSplit = useCallback(() => {
@@ -713,17 +734,23 @@ export function App() {
     };
     const leftClip: TimelineClip = { ...target, duration: offset };
 
-    setClips((prev) => [...prev.filter((c) => c.id !== target.id), leftClip, rightClip]);
+    const next = [...clipsRef.current.filter((c) => c.id !== target.id), leftClip, rightClip];
+    clipsRef.current = next;
+    setClips(next);
     setSelectedClipId(rightClip.id);
+    if (isPlayingRef.current) startAudioAt(playheadRef.current);
     showToast('ตัดแบ่งคลิปแล้ว');
-  }, [pushHistory, selectedClipId, showToast]);
+  }, [pushHistory, selectedClipId, showToast, startAudioAt]);
 
   const handleDelete = useCallback(() => {
     if (!selectedClipId) return;
     pushHistory(clipsRef.current);
-    setClips((prev) => prev.filter((c) => c.id !== selectedClipId));
+    const next = clipsRef.current.filter((c) => c.id !== selectedClipId);
+    clipsRef.current = next;
+    setClips(next);
     setSelectedClipId(null);
-  }, [pushHistory, selectedClipId]);
+    if (isPlayingRef.current) startAudioAt(playheadRef.current);
+  }, [pushHistory, selectedClipId, startAudioAt]);
 
   const handleRippleDelete = useCallback(() => {
     const sel = clipsRef.current.find((c) => c.id === selectedClipId);
@@ -731,41 +758,47 @@ export function App() {
     pushHistory(clipsRef.current);
     const gap = sel.duration;
     const end = sel.timelineStart + sel.duration;
-    setClips((prev) =>
-      prev
-        .filter((c) => c.id !== sel.id)
-        .map((c) =>
-          c.track === sel.track && c.timelineStart >= end - 0.01
-            ? { ...c, timelineStart: Math.max(0, c.timelineStart - gap) }
-            : c
-        )
-    );
+    const next = clipsRef.current
+      .filter((c) => c.id !== sel.id)
+      .map((c) =>
+        c.track === sel.track && c.timelineStart >= end - 0.01
+          ? { ...c, timelineStart: Math.max(0, c.timelineStart - gap) }
+          : c
+      );
+    clipsRef.current = next;
+    setClips(next);
     setSelectedClipId(null);
+    if (isPlayingRef.current) startAudioAt(playheadRef.current);
     showToast('ลบและเลื่อนคลิปมาชิดกันแล้ว');
-  }, [pushHistory, selectedClipId, showToast]);
+  }, [pushHistory, selectedClipId, showToast, startAudioAt]);
 
   const handleUndo = useCallback(() => {
-    setHistory((prev) => {
-      if (!prev.length) return prev;
-      const last = prev[prev.length - 1];
-      setRedoStack((r) => [...r, clipsRef.current]);
-      setClips(last);
-      return prev.slice(0, -1);
-    });
-  }, []);
+    const prevHist = historyRef.current;
+    if (!prevHist.length) return;
+    const last = prevHist[prevHist.length - 1];
+    const currentSnapshot = clipsRef.current.map((c) => ({ ...c }));
+    setHistory(prevHist.slice(0, -1));
+    setRedoStack((r) => [...r, currentSnapshot]);
+    clipsRef.current = last;
+    setClips(last);
+    if (isPlayingRef.current) startAudioAt(playheadRef.current);
+  }, [startAudioAt]);
 
   const handleRedo = useCallback(() => {
-    setRedoStack((prev) => {
-      if (!prev.length) return prev;
-      const next = prev[prev.length - 1];
-      setHistory((h) => [...h, clipsRef.current]);
-      setClips(next);
-      return prev.slice(0, -1);
-    });
-  }, []);
+    const prevRedo = redoStackRef.current;
+    if (!prevRedo.length) return;
+    const next = prevRedo[prevRedo.length - 1];
+    const currentSnapshot = clipsRef.current.map((c) => ({ ...c }));
+    setRedoStack(prevRedo.slice(0, -1));
+    setHistory((h) => [...h, currentSnapshot]);
+    clipsRef.current = next;
+    setClips(next);
+    if (isPlayingRef.current) startAudioAt(playheadRef.current);
+  }, [startAudioAt]);
 
   const handleClearProject = useCallback(() => {
     if (isPlayingRef.current) togglePlay(false);
+    videoSyncRef.current?.reset();
     assetsMapRef.current.forEach((a) => URL.revokeObjectURL(a.url));
     assetsMapRef.current.clear();
     setAssets([]);
@@ -1466,7 +1499,7 @@ export function App() {
     } finally {
       setIsTranscribing(false);
     }
-  }, [appendAiLog, pushHistory, selectedClipId, showToast, whisperApiKey, whisperProvider]);
+  }, [appendAiLog, ensureAudioCtx, pushHistory, selectedClipId, showToast, whisperApiKey, whisperProvider]);
 
   const handleAiSilenceCut = useCallback(() => {
     const audioClip =
@@ -1672,7 +1705,7 @@ export function App() {
 
       <Timeline
         clips={clips}
-        assets={assetsMapRef.current}
+        assets={assetsMap}
         selectedClipId={selectedClipId}
         playhead={playhead}
         totalDuration={totalDuration}

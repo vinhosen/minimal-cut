@@ -33,6 +33,8 @@ export interface MediaAsset {
   videoEl?: HTMLVideoElement;
   imgEl?: HTMLImageElement;
   audioBuffer?: AudioBuffer;
+  /** Decode state of the asset's audio track ('none' = no audio / undecodable / too large). */
+  audioStatus?: 'pending' | 'ready' | 'none';
   peaks?: Float32Array;
 }
 

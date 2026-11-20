@@ -197,6 +197,21 @@ function drawTextLayer(
   ctx.restore();
 }
 
+export interface RenderOptions {
+  /** Element that currently holds the frame for a video clip (double-buffered preview). Defaults to asset.videoEl. */
+  videoSource?: (clip: TimelineClip) => HTMLVideoElement | undefined;
+  /**
+   * When true and the active video element has no decoded frame yet (e.g. mid-seek),
+   * nothing is drawn so the canvas keeps the previous good frame instead of flashing black.
+   */
+  holdIfNotReady?: boolean;
+}
+
+export function isVideoFrameReady(el: HTMLVideoElement | undefined): boolean {
+  return Boolean(el && el.readyState >= 2 && !el.seeking);
+}
+
+/** Returns false when the frame was skipped because the video source was not ready. */
 export function renderCompositionFrame(
   ctx: CanvasRenderingContext2D,
   W: number,
@@ -205,20 +220,25 @@ export function renderCompositionFrame(
   clips: TimelineClip[],
   assets: Map<string, MediaAsset>,
   colors: ColorSettings,
-  showCenterGuides = false
-) {
-  ctx.fillStyle = '#0f1115';
-  ctx.fillRect(0, 0, W, H);
-
-  // 1. Video Track
+  showCenterGuides = false,
+  opts: RenderOptions = {}
+): boolean {
+  // 1. Video Track — resolve source first so we can hold the previous frame if it is not ready
   const activeVideo = clips.find(
     (c) => c.track === 'video' && time >= c.timelineStart && time < c.timelineStart + c.duration
   );
-  if (activeVideo && activeVideo.mediaId) {
-    const asset = assets.get(activeVideo.mediaId);
-    if (asset?.videoEl && asset.videoEl.readyState >= 2) {
-      drawVisualLayer(ctx, W, H, activeVideo, asset.videoEl, asset.width, asset.height, time, colors);
-    }
+  const videoAsset = activeVideo?.mediaId ? assets.get(activeVideo.mediaId) : undefined;
+  const videoEl = activeVideo && videoAsset ? (opts.videoSource?.(activeVideo) ?? videoAsset.videoEl) : undefined;
+  const videoReady = isVideoFrameReady(videoEl);
+  if (opts.holdIfNotReady && videoAsset?.videoEl && !videoReady) {
+    return false;
+  }
+
+  ctx.fillStyle = '#0f1115';
+  ctx.fillRect(0, 0, W, H);
+
+  if (activeVideo && videoAsset && videoEl && videoEl.readyState >= 2) {
+    drawVisualLayer(ctx, W, H, activeVideo, videoEl, videoAsset.width, videoAsset.height, time, colors);
   }
 
   // 2. Chroma Key (Green Screen)
@@ -292,4 +312,5 @@ export function renderCompositionFrame(
     ctx.stroke();
     ctx.restore();
   }
+  return true;
 }
