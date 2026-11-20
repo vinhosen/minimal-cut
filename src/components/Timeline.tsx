@@ -172,7 +172,7 @@ export const Timeline: React.FC<TimelineProps> = ({
   return (
     <section className="panel timeline-panel">
       <div className="timeline-toolbar">
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 }}>
           <button className="btn btn-secondary" onClick={onSplit} title="ตัดแบ่งคลิปตรงเส้นสีแดง (S)">
             <Scissors size={13} />
             <span>ตัดแบ่ง (S)</span>
@@ -205,8 +205,10 @@ export const Timeline: React.FC<TimelineProps> = ({
           </button>
         </div>
 
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-          <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>ซูมไทม์ไลน์</span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 }}>
+          <span className="hide-xs" style={{ fontSize: 11, color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>
+            ซูมไทม์ไลน์
+          </span>
           <input
             type="range"
             className="slider"

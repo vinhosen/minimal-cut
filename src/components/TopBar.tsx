@@ -1,7 +1,8 @@
 import React from 'react';
-import { Scissors, Undo2, Redo2, Download, Trash2, HardDrive } from 'lucide-react';
+import { Undo2, Redo2, Download, Trash2, HardDrive } from 'lucide-react';
 import type { ExportFps, ExportResolution } from '../types/editor';
 import type { Capabilities } from '../utils/capabilities';
+import { BrandLogo } from './BrandLogo';
 
 interface TopBarProps {
   fps: ExportFps;
@@ -51,9 +52,9 @@ export const TopBar: React.FC<TopBarProps> = ({
       <div className="topbar-left">
         <div className="brand-mark">
           <div className="brand-badge">
-            <Scissors size={15} />
+            <BrandLogo size={28} />
           </div>
-          <span>MinimalCut</span>
+          <h1 className="brand-title">MinimalCut</h1>
         </div>
         <div className="topbar-divider hide-mobile" />
         <div className="status-pill hide-mobile" title={capSummary}>

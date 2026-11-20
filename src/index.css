@@ -122,15 +122,24 @@ body,
   color: var(--text-primary);
 }
 
+.brand-title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  line-height: 1.2;
+  color: var(--text-primary);
+}
+
 .brand-badge {
   width: 28px;
   height: 28px;
+  flex-shrink: 0;
   border-radius: 8px;
-  background: var(--text-primary);
-  color: #ffffff;
   display: flex;
   align-items: center;
   justify-content: center;
+  overflow: hidden;
 }
 
 .topbar-divider {
@@ -491,6 +500,17 @@ body,
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+}
+
+.player-transport-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.play-toggle-btn {
+  min-width: 84px;
 }
 
 .timecode {
@@ -1024,6 +1044,8 @@ input[type='range'].slider::-webkit-slider-thumb {
 
   .timecode {
     font-size: 11px;
+    white-space: nowrap;
+    flex-shrink: 0;
   }
 
   .modal-card {
@@ -1038,12 +1060,35 @@ input[type='range'].slider::-webkit-slider-thumb {
     display: none !important;
   }
 
-  .brand-mark span {
+  .brand-title {
     font-size: 13px;
   }
 
   .btn {
     padding: 0 9px;
     font-size: 11px;
+  }
+
+  .player-transport {
+    padding: 0 8px;
+    gap: 4px;
+  }
+
+  .timecode {
+    font-size: 10px;
+  }
+
+  .player-transport-controls {
+    gap: 2px;
+  }
+
+  .player-transport-controls .btn-icon {
+    width: 28px;
+    height: 28px;
+  }
+
+  .play-toggle-btn {
+    min-width: 64px;
+    height: 28px;
   }
 }

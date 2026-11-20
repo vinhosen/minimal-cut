@@ -239,7 +239,7 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({
           <span className="timecode-muted"> / {formatTimecode(totalDuration, fps)}</span>
         </div>
 
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+        <div className="player-transport-controls">
           <button className="btn btn-ghost btn-icon" onClick={() => onSeek(0)} title="กลับไปจุดเริ่มต้น">
             <SkipBack size={15} />
           </button>
@@ -251,8 +251,7 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({
             <ChevronLeft size={16} />
           </button>
           <button
-            className={`btn ${isPlaying ? 'btn-dark' : 'btn-primary'}`}
-            style={{ minWidth: 84 }}
+            className={`btn play-toggle-btn ${isPlaying ? 'btn-dark' : 'btn-primary'}`}
             onClick={onTogglePlay}
           >
             {isPlaying ? <Pause size={14} /> : <Play size={14} />}
@@ -274,7 +273,7 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({
           </button>
         </div>
 
-        <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+        <div className="hide-mobile" style={{ fontSize: 11, color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>
           ลากบนจอ: ย้าย • ลูกกลิ้ง: ซูม
         </div>
       </div>
