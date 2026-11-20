@@ -120,6 +120,9 @@ export function App() {
   const playRequestIdRef = useRef(0);
   const pendingPlayRef = useRef(false);
   const vfcPaintedThisFrameRef = useRef(false);
+  const elementAudioBridgeRef = useRef(
+    new WeakMap<HTMLVideoElement, { ctx: AudioContext; gain: GainNode }>()
+  );
 
   const micRecorderRef = useRef<MediaRecorder | null>(null);
   const micChunksRef = useRef<Blob[]>([]);
@@ -328,7 +331,7 @@ export function App() {
   }, [getAudioScheduler]);
 
   const ensureAudioCtx = useCallback(() => {
-    if (!audioCtxRef.current) {
+    if (!audioCtxRef.current || audioCtxRef.current.state === 'closed') {
       const ctx = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
       audioCtxRef.current = ctx;
 
@@ -397,19 +400,50 @@ export function App() {
     );
   }, [getAudioScheduler]);
 
+  /**
+   * Routes a `<video>` element's audio through Web Audio (`MediaElementAudioSourceNode`) when its
+   * `AudioBuffer` has not decoded yet or failed `decodeAudioData`, keeping all audio inside the graph.
+   */
+  const connectElementAudio = useCallback((el: HTMLVideoElement, active: boolean, volume: number): boolean => {
+    const ctx = audioCtxRef.current;
+    if (!ctx || ctx.state === 'closed') return false;
+    const existing = elementAudioBridgeRef.current.get(el);
+    if (existing) {
+      if (existing.ctx !== ctx) return false;
+      existing.gain.gain.value = active ? Math.max(0, volume) : 0;
+      return true;
+    }
+    if (!active) return true;
+    try {
+      const src = ctx.createMediaElementSource(el);
+      const gain = ctx.createGain();
+      gain.gain.value = Math.max(0, volume);
+      src.connect(gain);
+      gain.connect(masterGainRef.current || ctx.destination);
+      elementAudioBridgeRef.current.set(el, { ctx, gain });
+      return true;
+    } catch {
+      return false;
+    }
+  }, []);
+
   const syncVideoElements = useCallback(
     (time: number, forceSeek: boolean) => {
       const sync = getVideoSync();
-      // Phase 2 Guardrails: Always mute <video> so all audio runs exclusively through Web Audio,
-      // and slave video drift to the AudioContext Master Clock with a strict 80ms threshold.
-      const syncOpts = { driftThresholdSec: 0.08, alwaysMuteVideo: true };
+      // Phase 2 Guardrails: Mute <video> when AudioBuffer plays via AudioScheduler,
+      // route fallback unbuffered audio through Web Audio bridge, and slave drift > 80ms.
+      const syncOpts = {
+        driftThresholdSec: 0.08,
+        alwaysMuteVideo: true,
+        connectElementAudio,
+      };
       if (forceSeek) {
         sync.seekDiscrete(time, clipsRef.current, isPlayingRef.current, syncOpts);
       } else {
         sync.updatePlayback(time, clipsRef.current, syncOpts);
       }
     },
-    [getVideoSync]
+    [connectElementAudio, getVideoSync]
   );
 
   const seekTo = useCallback(

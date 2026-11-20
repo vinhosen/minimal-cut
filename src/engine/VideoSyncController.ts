@@ -19,10 +19,15 @@ export interface PlaybackSyncOptions {
    */
   driftThresholdSec?: number;
   /**
-   * When true (Phase 2), always mute underlying `<video>` elements so all audio passes
-   * exclusively through the Web Audio graph.
+   * When true (Phase 2), mute underlying `<video>` elements so audio passes exclusively through
+   * the Web Audio graph (`AudioBufferSourceNode` when decoded, or `connectElementAudio` bridge).
    */
   alwaysMuteVideo?: boolean;
+  /**
+   * Optional Web Audio `MediaElementAudioSourceNode` bridge used when `asset.audioBuffer` is not
+   * decoded yet or failed `decodeAudioData`. Returns `true` if routed through Web Audio cleanly.
+   */
+  connectElementAudio?: (el: HTMLVideoElement, active: boolean, volume: number) => boolean;
 }
 
 /**
@@ -188,17 +193,44 @@ export class VideoSyncController {
     }
     this.assignment = keep;
 
-    // Pause all idle elements outside active clip bounds
+    // Pause all idle elements outside active clip bounds and silence any fallback audio bridge
     this.getAssets().forEach((asset) => {
       if (asset.type !== 'video' || !asset.videoEl) return;
       for (const el of [asset.videoEl, this.standby.get(asset.id)]) {
-        if (el && el !== activeEl && !el.paused) {
-          el.pause();
+        if (el && el !== activeEl) {
+          if (!el.paused) el.pause();
+          el.muted = true;
         }
       }
     });
 
     return { active, activeEl, upcoming, upcomingEl };
+  }
+
+  private applyAudioRouting(
+    el: HTMLVideoElement,
+    clip: TimelineClip,
+    asset: MediaAsset | undefined,
+    opts: PlaybackSyncOptions
+  ): void {
+    const vol = Math.min(1, Math.max(0, (clip.volume ?? 100) / 100));
+    el.volume = vol;
+
+    if (clip.muted || clip.reverse || asset?.audioBuffer) {
+      el.muted = true;
+      opts.connectElementAudio?.(el, false, 0);
+      return;
+    }
+
+    // Asset has no decoded AudioBuffer yet (still decoding, >1GB, or decodeAudioData unsupported):
+    // Route element audio through Web Audio MediaElementAudioSourceNode (or unmute element as last resort)
+    // so playback never goes silent while alwaysMuteVideo is requested.
+    if (opts.connectElementAudio) {
+      opts.connectElementAudio(el, true, vol);
+      el.muted = false;
+    } else {
+      el.muted = Boolean(opts.alwaysMuteVideo);
+    }
   }
 
   private preRollUpcoming(
@@ -244,8 +276,7 @@ export class VideoSyncController {
       const duration = asset?.duration ?? activeEl.duration;
       const tgt = Math.max(0, Math.min(clipSourceTime(active, time), duration || Infinity));
 
-      activeEl.muted = Boolean(opts.alwaysMuteVideo || asset?.audioBuffer || active.muted || active.reverse);
-      activeEl.volume = Math.min(1, Math.max(0, (active.volume ?? 100) / 100));
+      this.applyAudioRouting(activeEl, active, asset, opts);
       activeEl.playbackRate = spd;
 
       if (Math.abs(activeEl.currentTime - tgt) > 0.004) {
@@ -291,8 +322,7 @@ export class VideoSyncController {
       const duration = asset?.duration ?? activeEl.duration;
       const tgt = Math.max(0, Math.min(clipSourceTime(active, time), duration || Infinity));
 
-      activeEl.muted = Boolean(opts.alwaysMuteVideo || asset?.audioBuffer || active.muted || active.reverse);
-      activeEl.volume = Math.min(1, Math.max(0, (active.volume ?? 100) / 100));
+      this.applyAudioRouting(activeEl, active, asset, opts);
       if (activeEl.playbackRate !== spd) {
         activeEl.playbackRate = spd;
       }
