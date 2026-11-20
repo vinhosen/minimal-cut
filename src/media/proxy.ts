@@ -62,80 +62,84 @@ export async function generateVideoProxy(
   vid.playsInline = true;
   vid.preload = 'auto';
 
-  await new Promise<void>((resolve, reject) => {
-    vid.onloadeddata = () => resolve();
-    vid.onerror = () => reject(new Error('proxy load error'));
-  });
-
-  const dur = Math.min(asset.duration || vid.duration || 5, 180);
-  const totalFrames = Math.max(1, Math.ceil(dur * PROXY_FPS));
-
   let writable: FileSystemWritableFileStream | null = null;
-  let memTarget: ArrayBufferTarget | null = null;
-  let muxerTarget: ArrayBufferTarget | FileSystemWritableFileStreamTarget;
-
-  if (opfsAvailable()) {
-    try {
-      const fh = await getOpfsFileHandle(relPath, true);
-      writable = await fh.createWritable();
-      muxerTarget = new FileSystemWritableFileStreamTarget(writable);
-    } catch {
-      writable = null;
-    }
-  }
-  if (!writable) {
-    memTarget = new ArrayBufferTarget();
-    muxerTarget = memTarget;
-  }
-
-  const muxer = new Muxer({
-    target: muxerTarget!,
-    video: { codec: 'avc', width: W, height: H },
-    fastStart: writable ? { expectedVideoChunks: totalFrames + 16 } : 'in-memory',
-  });
-
-  const encoder = new VideoEncoder({
-    output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
-    error: () => {},
-  });
-
-  encoder.configure({
-    codec: 'avc1.42001f',
-    width: W,
-    height: H,
-    bitrate: PROXY_BITRATE,
-    framerate: PROXY_FPS,
-    hardwareAcceleration: 'prefer-hardware',
-  });
-
-  const canvas =
-    typeof OffscreenCanvas !== 'undefined'
-      ? new OffscreenCanvas(W, H)
-      : Object.assign(document.createElement('canvas'), { width: W, height: H });
-  const ctx = canvas.getContext('2d', { alpha: false }) as
-    | CanvasRenderingContext2D
-    | OffscreenCanvasRenderingContext2D;
-  const frameDurationUs = Math.round(1_000_000 / PROXY_FPS);
+  let encoder: VideoEncoder | null = null;
 
   try {
+    await new Promise<void>((resolve, reject) => {
+      vid.onloadeddata = () => resolve();
+      vid.onerror = () => reject(new Error('proxy load error'));
+    });
+
+    const dur = Math.min(asset.duration || vid.duration || 5, 180);
+    const totalFrames = Math.max(1, Math.ceil(dur * PROXY_FPS));
+
+    let memTarget: ArrayBufferTarget | null = null;
+    let muxerTarget: ArrayBufferTarget | FileSystemWritableFileStreamTarget;
+
+    if (opfsAvailable()) {
+      try {
+        const fh = await getOpfsFileHandle(relPath, true);
+        writable = await fh.createWritable();
+        muxerTarget = new FileSystemWritableFileStreamTarget(writable);
+      } catch {
+        writable = null;
+      }
+    }
+    if (!writable) {
+      memTarget = new ArrayBufferTarget();
+      muxerTarget = memTarget;
+    }
+
+    const muxer = new Muxer({
+      target: muxerTarget!,
+      video: { codec: 'avc', width: W, height: H },
+      fastStart: writable ? { expectedVideoChunks: totalFrames + 16 } : 'in-memory',
+    });
+
+    encoder = new VideoEncoder({
+      output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
+      error: () => {},
+    });
+
+    encoder.configure({
+      codec: 'avc1.42001f',
+      width: W,
+      height: H,
+      bitrate: PROXY_BITRATE,
+      framerate: PROXY_FPS,
+      hardwareAcceleration: 'prefer-hardware',
+    });
+
+    const canvas =
+      typeof OffscreenCanvas !== 'undefined'
+        ? new OffscreenCanvas(W, H)
+        : Object.assign(document.createElement('canvas'), { width: W, height: H });
+    const ctx = canvas.getContext('2d', { alpha: false }) as
+      | CanvasRenderingContext2D
+      | OffscreenCanvasRenderingContext2D;
+    const frameDurationUs = Math.round(1_000_000 / PROXY_FPS);
+
     for (let f = 0; f < totalFrames; f++) {
-      const t = f / PROXY_FPS;
-      await new Promise<void>((resolve) => {
-        const done = () => {
-          vid.removeEventListener('seeked', done);
-          resolve();
-        };
-        const timer = setTimeout(done, 300);
-        vid.addEventListener(
-          'seeked',
-          () => {
-            clearTimeout(timer);
-            done();
-          },
-          { once: true }
-        );
-        vid.currentTime = Math.min(dur, t);
-      });
+      const targetT = Math.min(dur, f / PROXY_FPS);
+      if (vid.seeking || Math.abs(vid.currentTime - targetT) >= 0.002 || vid.readyState < 2) {
+        await new Promise<void>((resolve) => {
+          const done = () => {
+            vid.removeEventListener('seeked', done);
+            resolve();
+          };
+          const timer = setTimeout(done, 300);
+          vid.addEventListener(
+            'seeked',
+            () => {
+              clearTimeout(timer);
+              done();
+            },
+            { once: true }
+          );
+          vid.currentTime = targetT;
+        });
+      }
 
       ctx.drawImage(vid, 0, 0, W, H);
       const vf = new VideoFrame(canvas, {
@@ -159,27 +163,38 @@ export async function generateVideoProxy(
       }
     }
     await encoder.flush();
+    muxer.finalize();
+    if (writable) {
+      await writable.close();
+      writable = null;
+    }
+
+    const proxyFile =
+      (await opfsLoadFile(relPath, `proxy_${asset.name}`, 'video/mp4')) ??
+      (memTarget ? new File([memTarget.buffer], `proxy_${asset.name}`, { type: 'video/mp4' }) : null);
+
+    if (!proxyFile) {
+      onStatus({ proxyStatus: 'failed' });
+      return null;
+    }
+
+    const proxyUrl = URL.createObjectURL(proxyFile);
+    onStatus({ proxyUrl, proxyStatus: 'ready', proxyProgress: 100 });
+    return proxyUrl;
   } catch {
     if (writable) await writable.abort().catch(() => {});
     onStatus({ proxyStatus: 'failed' });
     return null;
   } finally {
-    if (encoder.state !== 'closed') encoder.close();
+    if (encoder && encoder.state !== 'closed') {
+      try {
+        encoder.close();
+      } catch {
+        // ignore
+      }
+    }
+    vid.pause();
+    vid.removeAttribute('src');
+    vid.load();
   }
-
-  muxer.finalize();
-  if (writable) await writable.close();
-
-  const proxyFile =
-    (await opfsLoadFile(relPath, `proxy_${asset.name}`, 'video/mp4')) ??
-    (memTarget ? new File([memTarget.buffer], `proxy_${asset.name}`, { type: 'video/mp4' }) : null);
-
-  if (!proxyFile) {
-    onStatus({ proxyStatus: 'failed' });
-    return null;
-  }
-
-  const proxyUrl = URL.createObjectURL(proxyFile);
-  onStatus({ proxyUrl, proxyStatus: 'ready', proxyProgress: 100 });
-  return proxyUrl;
 }

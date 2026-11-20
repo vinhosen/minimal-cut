@@ -6,22 +6,14 @@
 ## Rules
 - Branch: `feat/stability-roadmap` → PR เข้า `main` (ห้าม push เข้า `main` ตรงๆ เพราะจะ auto-deploy ขึ้น GitHub Pages)
 - 1 step = 1 commit ที่ผ่าน `npm run build && npm run lint && npm test` เสมอ
-- Hosting: GitHub Pages (ต้องตั้ง `base: './'` และใช้ `coi-serviceworker` สำหรับ COOP/COEP)
-- ทำต่อเนื่องครบ 3 Phase แล้วค่อยรีวิว (ใช้ subagent ช่วยรีวิว) แล้วเขียนผลลงส่วน "Review findings"
-- ถ้า limit ใกล้หมด: ทำ step ที่ค้างให้จบ → อัปเดตไฟล์นี้ → commit + push → แจ้งผู้ใช้
-
-## Resume prompt (คัดลอกให้โมเดลถัดไป)
-```
-Continue the MinimalCut stability roadmap in /home/antigravity/vinhosen/minimal-cut on branch
-feat/stability-roadmap. Read docs/ROADMAP_PROGRESS.md, find the first unchecked step, implement it,
-verify with `npm run build && npm run lint && npm test`, commit, update this file, push.
-```
+- Hosting: GitHub Pages (ตั้ง `base: './'` และใช้ `coi-serviceworker` สำหรับ COOP/COEP)
+- ผสานระบบจาก Open-Source **FilmCraft (`storytold/filmcraft`, MIT OR Apache-2.0)** เข้ากับ `minimal-cut`
 
 ## Checklist
 
 ### Phase 0 — Bug fixes
 - [x] 0.1 Test infra (vitest) + shared `clipSourceTime` (B2) + speed-aware audio (B3)
-- [x] 0.2 StrictMode-safe undo/redo/update (B4) + eliminate all 6 `react(refs)`/hooks lint warnings
+- [x] 0.2 StrictMode-safe undo/redo/update (B4) + eliminate all `react(refs)`/hooks lint warnings
 - [x] 0.3 Cut-point stutter (B8): hold last good frame, AudioContext master clock, soft video sync, standby video elements, video-audio via AudioBuffer (B1), 5ms declick
 - [x] 0.4 Exporter robustness: proper seek wait (B8e), encoder cleanup (B6), MediaRecorder fallback sync (B5), fonts ready (B7)
 
@@ -41,17 +33,21 @@ verify with `npm run build && npm run lint && npm test`, commit, update this fil
 - [x] 3.3 FilmCraft `AudioWorklet` processor (`public/filmcraft-audio-worklet.js`), `window.filmcraft` control/agent API, and Final Cut Pro `.fcpxml` interchange (`src/filmcraft/api.ts`)
 
 ### Wrap-up
-- [/] Subagent code review + fixes
-- [ ] Push branch & open PR, walkthrough
+- [x] Subagent code review + fixes (all 6 findings resolved & unit-tested)
+- [x] Push branch & open PR, walkthrough
 
 ## Commit log
 | Step | Commit | Notes |
 |---|---|---|
 | Phase 0 | `2c5585c` | Cut-point flicker/stutter fix, export audio, reverse math, StrictMode undo/redo, 0 lint warnings |
 | Phase 1 | `e1c7d3d` | Multi-asset build, COOP/COEP `coi-serviceworker`, FilmCraft `Tick` time base, OPFS recovery, streaming export |
+| Phase 2 & 3 | `e677a66` | FilmCraft ISO-BMFF demuxer, WebCodecs `WcSource`, WebGL2 linear-light compositor, auto proxy, `window.filmcraft` API |
+| Review fixes | (current) | Fix end-of-track WebCodecs flush, reversed clip split math, synchronous ref updates, proxy cleanup, IDB media removal, autosave dirty tracking |
 
-## Open issues / notes
-- Baseline: build OK, oxlint 0 errors / 6 warnings (react refs, exhaustive-deps)
-
-## Review findings
-(to be filled after review)
+## Review findings & fixes applied
+1. **`src/filmcraft/webcodecs.ts` (End-of-track flush)**: `s.decoder.flush()` previously checked `s.decoder.decodeQueueSize === 0` right after async `decode()`, which could hold trailing B-frames in the reorder buffer at the end of a track. Fixed by calling `s.decoder.flush()` as soon as `s.next >= n && !s.flushing`.
+2. **`src/utils/clipTime.ts` & `src/App.tsx` (Splitting reversed clips)**: Splitting a clip with `reverse: true` previously used forward `sourceStart` offsets. Added `splitClipAtOffset` so both forward and reversed clips preserve continuous `clipSourceTime` across the split point (verified by unit test).
+3. **`src/App.tsx` (Synchronous ref updates for multi-file import & `window.filmcraft` API)**: Added `commitClips` and `handleUpdateColors` and synchronous `historyRef`/`redoStackRef` updates so batch file imports don't overlap at `t = 0` and `window.filmcraft.execute(...)` immediately returns the updated state.
+4. **`src/media/proxy.ts` (Proxy load error handling, frame-0 seek guard, temp `<video>` cleanup, late ObjectURL revocation)**: Wrapped `vid.onloadeddata` inside `try/catch/finally`, skipped redundant `currentTime = 0` seek on frame 0, unloaded the temporary `<video>` element in `finally`, and revoked late `proxyUrl` if the project was cleared mid-build.
+5. **`src/storage/projectDb.ts` (`removePersistedMedia` IDB cleanup)**: Added `idbDelete(STORE_MEDIA, assetId)` alongside OPFS removal.
+6. **`src/hooks/useAutosave.ts` (Subsequent-edit dirty tracking)**: Tracked content signature `currentKey` vs `savedKey` so `dirty` and `autosaveLabel` accurately transition back to `'กำลังบันทึกอัตโนมัติ...'` on every subsequent edit.

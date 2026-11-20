@@ -400,7 +400,7 @@ export class WcSource {
         s.next++;
       }
 
-      if (s.next >= n && s.decoder.decodeQueueSize === 0 && !s.flushing) {
+      if (s.next >= n && !s.flushing) {
         s.flushing = true;
         s.needsKey = true;
         s.decoder

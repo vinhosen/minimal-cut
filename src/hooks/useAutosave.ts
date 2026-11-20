@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { AspectRatio, ColorSettings, ExportSettings, MediaAsset, TimelineClip } from '../types/editor';
 import {
   buildProjectSnapshot,
@@ -22,12 +22,24 @@ export function useAutosave(params: AutosaveParams): {
   flushAutosave: () => Promise<void>;
 } {
   const { clips, assets, colors, aspectRatio, exportSettings, enabled = true } = params;
-  const [lastSavedRev, setLastSavedRev] = useState(0);
+  const [savedKey, setSavedKey] = useState<string>('');
 
   const revisionRef = useRef(0);
   const savedRevisionRef = useRef(0);
   const policyRef = useRef<RecoveryPolicy | null>(null);
   const latestRef = useRef(params);
+
+  // Content signature representing current project state
+  const currentKey = useMemo(() => {
+    if (clips.length === 0) return '';
+    return JSON.stringify({
+      aspectRatio,
+      colors,
+      exportSettings,
+      assetIds: assets.map((a) => a.id),
+      clips,
+    });
+  }, [clips, assets, colors, aspectRatio, exportSettings]);
 
   useEffect(() => {
     latestRef.current = params;
@@ -41,13 +53,14 @@ export function useAutosave(params: AutosaveParams): {
     if (clips.length === 0) {
       savedRevisionRef.current = revisionRef.current;
       void markRecoveryClean().then(() => {
-        setLastSavedRev(revisionRef.current);
+        setSavedKey('');
       });
       return;
     }
 
     revisionRef.current += 1;
     const rev = revisionRef.current;
+    const keySnapshot = currentKey;
     const policy = policyRef.current;
 
     const timer = setTimeout(async () => {
@@ -67,13 +80,13 @@ export function useAutosave(params: AutosaveParams): {
         policy.written(rev, ok, performance.now() / 1000);
         if (ok) {
           savedRevisionRef.current = rev;
-          setLastSavedRev(rev);
+          setSavedKey(keySnapshot);
         }
       }
     }, 1500);
 
     return () => clearTimeout(timer);
-  }, [clips, assets, colors, aspectRatio, exportSettings, enabled]);
+  }, [currentKey, clips.length, enabled]);
 
   // Request persistent storage once and flush snapshot on pagehide / visibilitychange
   useEffect(() => {
@@ -111,6 +124,7 @@ export function useAutosave(params: AutosaveParams): {
     const cur = latestRef.current;
     if (cur.clips.length === 0) {
       await markRecoveryClean();
+      setSavedKey('');
       return;
     }
     const snap = buildProjectSnapshot({
@@ -123,14 +137,14 @@ export function useAutosave(params: AutosaveParams): {
     });
     await saveRecoverySnapshot(snap, true);
     savedRevisionRef.current = revisionRef.current;
-    setLastSavedRev(revisionRef.current);
+    setSavedKey(currentKey);
   };
 
-  const dirty = clips.length > 0 && lastSavedRev === 0;
+  const dirty = clips.length > 0 && savedKey !== currentKey;
   const autosaveLabel =
     clips.length === 0
       ? 'บันทึกอัตโนมัติพร้อมใช้'
-      : lastSavedRev > 0
+      : !dirty
         ? 'บันทึกอัตโนมัติแล้ว (OPFS)'
         : 'กำลังบันทึกอัตโนมัติ...';
 

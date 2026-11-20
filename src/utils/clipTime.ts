@@ -70,3 +70,38 @@ export function hasSeamlessNeighbor(
     o.id !== clip.id && (side === 'prev' ? isSeamlessContinuation(o, clip) : isSeamlessContinuation(clip, o))
   );
 }
+
+/**
+ * Splits a clip at clip-local timeline offset `offset` (`0 < offset < target.duration`).
+ * Handles both forward and reversed clips so `clipSourceTime` is continuous across the split.
+ */
+export function splitClipAtOffset(
+  target: TimelineClip,
+  offset: number,
+  rightId: string
+): [TimelineClip, TimelineClip] {
+  const spd = target.speed || 1;
+  const rightDur = target.duration - offset;
+  const leftSourceStart = target.reverse
+    ? target.sourceStart + rightDur * spd
+    : target.sourceStart;
+  const rightSourceStart = target.reverse
+    ? target.sourceStart
+    : target.sourceStart + offset * spd;
+
+  const leftClip: TimelineClip = {
+    ...target,
+    duration: offset,
+    sourceStart: leftSourceStart,
+    fxData: target.fxData ? { ...target.fxData } : undefined,
+  };
+  const rightClip: TimelineClip = {
+    ...target,
+    id: rightId,
+    timelineStart: target.timelineStart + offset,
+    duration: rightDur,
+    sourceStart: rightSourceStart,
+    fxData: target.fxData ? { ...target.fxData } : undefined,
+  };
+  return [leftClip, rightClip];
+}

@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import type { TimelineClip } from '../types/editor';
-import { clipSourceTime, findNextClip, hasSeamlessNeighbor, isSeamlessContinuation } from '../utils/clipTime';
+import {
+  clipSourceTime,
+  findNextClip,
+  hasSeamlessNeighbor,
+  isSeamlessContinuation,
+  splitClipAtOffset,
+} from '../utils/clipTime';
 import { clipGainAt, DECLICK_SEC, envelopeBreakpoints } from '../audio/scheduleClipAudio';
 
 function makeClip(overrides: Partial<TimelineClip> = {}): TimelineClip {
@@ -92,5 +98,23 @@ describe('Phase 0 — clipTime & audio envelope', () => {
     expect(bps).toContain(1.5);
     expect(bps).toContain(2 - DECLICK_SEC);
     expect(bps).toContain(2);
+  });
+
+  it('preserves continuous source timestamps when splitting forward and reversed clips', () => {
+    const rev = makeClip({
+      timelineStart: 2,
+      duration: 6,
+      sourceStart: 3,
+      speed: 1.5,
+      reverse: true,
+    });
+    const [left, right] = splitClipAtOffset(rev, 2.5, 'right_id');
+    // At t=3.0 (inside left half)
+    expect(clipSourceTime(left, 3.0)).toBeCloseTo(clipSourceTime(rev, 3.0));
+    // At split boundary t=4.5
+    expect(clipSourceTime(left, 4.5)).toBeCloseTo(clipSourceTime(rev, 4.5));
+    expect(clipSourceTime(right, 4.5)).toBeCloseTo(clipSourceTime(rev, 4.5));
+    // At t=6.5 (inside right half)
+    expect(clipSourceTime(right, 6.5)).toBeCloseTo(clipSourceTime(rev, 6.5));
   });
 });

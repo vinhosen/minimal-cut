@@ -331,9 +331,34 @@ export async function restoreMediaFile(item: AssetManifestItem): Promise<File | 
   return new File([fromIdb], item.name, { type: item.mimeType || fromIdb.type });
 }
 
+async function idbDelete(storeName: string, key: string): Promise<void> {
+  const db = await openIdb();
+  if (!db) return;
+  await new Promise<void>((resolve) => {
+    try {
+      const tx = db.transaction(storeName, 'readwrite');
+      tx.objectStore(storeName).delete(key);
+      tx.oncomplete = () => {
+        db.close();
+        resolve();
+      };
+      tx.onerror = () => {
+        db.close();
+        resolve();
+      };
+    } catch {
+      db.close();
+      resolve();
+    }
+  });
+}
+
 export async function removePersistedMedia(assetId: string): Promise<void> {
-  await opfsRemove(`media/${assetId}`);
-  await opfsRemove(`proxy/${assetId}.mp4`);
+  await Promise.all([
+    opfsRemove(`media/${assetId}`),
+    opfsRemove(`proxy/${assetId}.mp4`),
+    idbDelete(STORE_MEDIA, assetId),
+  ]);
 }
 
 export async function clearAllRecoveryData(): Promise<void> {

@@ -8,6 +8,7 @@ import type {
   TimelineClip,
 } from './types/editor';
 import { computeAudioPeaks, getCanvasDimensions, nextId } from './utils/timecode';
+import { splitClipAtOffset } from './utils/clipTime';
 import { exportProjectToMp4, type ExportProgress } from './utils/exporter';
 import { exportViaRustEngine, isRustBackendAvailable, uploadMediaToRust } from './utils/rustBridge';
 import { audibleClips, scheduleClipAudio } from './audio/scheduleClipAudio';
@@ -194,6 +195,18 @@ export function App() {
     redoStackRef.current = [];
     setHistory(next);
     setRedoStack([]);
+  }, []);
+
+  const commitClips = useCallback((next: TimelineClip[]) => {
+    clipsRef.current = next;
+    totalDurationRef.current = next.length ? Math.max(...next.map((c) => c.timelineStart + c.duration)) : 0;
+    setClips(next);
+  }, []);
+
+  const handleUpdateColors = useCallback((patch: Partial<ColorSettings>) => {
+    const next = { ...colorsRef.current, ...patch };
+    colorsRef.current = next;
+    setColors(next);
   }, []);
 
   // Forward-declared so the video controller and WebCodecs decoder can request a redraw once a frame lands.
@@ -572,10 +585,11 @@ export function App() {
         };
       }
 
-      setClips((prev) => [...prev, newClip]);
+      const next = [...list, newClip];
+      commitClips(next);
       setSelectedClipId(newClip.id);
     },
-    [pushHistory]
+    [commitClips, pushHistory]
   );
 
   const attachVideoEnhancements = useCallback(
@@ -584,6 +598,10 @@ export function App() {
       getRenderClient().registerAsset(asset);
       if (shouldBuildAutoProxy(asset)) {
         void generateVideoProxy(asset, (patch) => {
+          if (!assetsMapRef.current.has(asset.id)) {
+            if (patch.proxyUrl) URL.revokeObjectURL(patch.proxyUrl);
+            return;
+          }
           Object.assign(asset, patch);
           setAssets((prev) => prev.map((a) => (a.id === asset.id ? { ...asset } : a)));
         });
@@ -599,6 +617,7 @@ export function App() {
           const asset = await createAssetFromFile(file, {
             getAudioCtx: ensureAudioCtx,
             onAudioReady: (readyAsset) => {
+              if (!assetsMapRef.current.has(readyAsset.id)) return;
               setAssets((prev) => prev.map((a) => (a.id === readyAsset.id ? { ...readyAsset } : a)));
               if (isPlayingRef.current) {
                 if (readyAsset.type === 'video') syncVideoElements(playheadRef.current, false);
@@ -643,6 +662,7 @@ export function App() {
             id: item.id,
             getAudioCtx: ensureAudioCtx,
             onAudioReady: (readyAsset) => {
+              if (!assetsMapRef.current.has(readyAsset.id)) return;
               setAssets((prev) => prev.map((a) => (a.id === readyAsset.id ? { ...readyAsset } : a)));
             },
           });
@@ -655,11 +675,10 @@ export function App() {
       }
 
       if (snapshot.aspectRatio) setAspectRatio(snapshot.aspectRatio);
-      if (snapshot.colors) setColors({ ...DEFAULT_COLORS, ...snapshot.colors });
+      if (snapshot.colors) handleUpdateColors({ ...DEFAULT_COLORS, ...snapshot.colors });
       if (snapshot.exportSettings) setExportSettings(snapshot.exportSettings);
       setAssets(restoredAssets);
-      clipsRef.current = snapshot.clips;
-      setClips(snapshot.clips);
+      commitClips(snapshot.clips);
       setRecoveryCandidate(null);
       showToast(`กู้คืนโปรเจกต์สำเร็จ (${snapshot.clips.length} คลิป)`);
     } catch {
@@ -668,7 +687,7 @@ export function App() {
     } finally {
       setIsRestoringRecovery(false);
     }
-  }, [attachVideoEnhancements, ensureAudioCtx, recoveryCandidate, showToast]);
+  }, [attachVideoEnhancements, commitClips, ensureAudioCtx, handleUpdateColors, recoveryCandidate, showToast]);
 
   const handleDiscardRecovery = useCallback(async () => {
     setRecoveryCandidate(null);
@@ -716,10 +735,10 @@ export function App() {
           y: y ?? (style === 'title' ? 50 : 82),
         },
       };
-      setClips((prev) => [...prev, newClip]);
+      commitClips([...clipsRef.current, newClip]);
       setSelectedClipId(newClip.id);
     },
-    [pushHistory]
+    [commitClips, pushHistory]
   );
 
   const handleUpdateClip = useCallback(
@@ -728,8 +747,7 @@ export function App() {
         pushHistory(clipsRef.current);
       }
       const next = clipsRef.current.map((c) => (c.id === id ? { ...c, ...patch } : c));
-      clipsRef.current = next;
-      setClips(next);
+      commitClips(next);
 
       if (
         isPlayingRef.current &&
@@ -748,7 +766,7 @@ export function App() {
         startAudioAt(playheadRef.current);
       }
     },
-    [pushHistory, startAudioAt]
+    [commitClips, pushHistory, startAudioAt]
   );
 
   const handleSplit = useCallback(() => {
@@ -766,34 +784,23 @@ export function App() {
 
     pushHistory(clipsRef.current);
     const offset = t - target.timelineStart;
-    const spd = target.speed || 1;
-    const rightClip: TimelineClip = {
-      ...target,
-      id: nextId('clip'),
-      timelineStart: t,
-      duration: target.duration - offset,
-      sourceStart: target.sourceStart + offset * spd,
-      fxData: target.fxData ? { ...target.fxData } : undefined,
-    };
-    const leftClip: TimelineClip = { ...target, duration: offset };
+    const [leftClip, rightClip] = splitClipAtOffset(target, offset, nextId('clip'));
 
     const next = [...clipsRef.current.filter((c) => c.id !== target.id), leftClip, rightClip];
-    clipsRef.current = next;
-    setClips(next);
+    commitClips(next);
     setSelectedClipId(rightClip.id);
     if (isPlayingRef.current) startAudioAt(playheadRef.current);
     showToast('ตัดแบ่งคลิปแล้ว');
-  }, [pushHistory, selectedClipId, showToast, startAudioAt]);
+  }, [commitClips, pushHistory, selectedClipId, showToast, startAudioAt]);
 
   const handleDelete = useCallback(() => {
     if (!selectedClipId) return;
     pushHistory(clipsRef.current);
     const next = clipsRef.current.filter((c) => c.id !== selectedClipId);
-    clipsRef.current = next;
-    setClips(next);
+    commitClips(next);
     setSelectedClipId(null);
     if (isPlayingRef.current) startAudioAt(playheadRef.current);
-  }, [pushHistory, selectedClipId, startAudioAt]);
+  }, [commitClips, pushHistory, selectedClipId, startAudioAt]);
 
   const handleRippleDelete = useCallback(() => {
     const sel = clipsRef.current.find((c) => c.id === selectedClipId);
@@ -808,36 +815,41 @@ export function App() {
           ? { ...c, timelineStart: Math.max(0, c.timelineStart - gap) }
           : c
       );
-    clipsRef.current = next;
-    setClips(next);
+    commitClips(next);
     setSelectedClipId(null);
     if (isPlayingRef.current) startAudioAt(playheadRef.current);
     showToast('ลบและเลื่อนคลิปมาชิดกันแล้ว');
-  }, [pushHistory, selectedClipId, showToast, startAudioAt]);
+  }, [commitClips, pushHistory, selectedClipId, showToast, startAudioAt]);
 
   const handleUndo = useCallback(() => {
     const prevHist = historyRef.current;
     if (!prevHist.length) return;
     const last = prevHist[prevHist.length - 1];
     const currentSnapshot = clipsRef.current.map((c) => ({ ...c }));
-    setHistory(prevHist.slice(0, -1));
-    setRedoStack((r) => [...r, currentSnapshot]);
-    clipsRef.current = last;
-    setClips(last);
+    const nextHist = prevHist.slice(0, -1);
+    const nextRedo = [...redoStackRef.current, currentSnapshot];
+    historyRef.current = nextHist;
+    redoStackRef.current = nextRedo;
+    setHistory(nextHist);
+    setRedoStack(nextRedo);
+    commitClips(last);
     if (isPlayingRef.current) startAudioAt(playheadRef.current);
-  }, [startAudioAt]);
+  }, [commitClips, startAudioAt]);
 
   const handleRedo = useCallback(() => {
     const prevRedo = redoStackRef.current;
     if (!prevRedo.length) return;
     const next = prevRedo[prevRedo.length - 1];
     const currentSnapshot = clipsRef.current.map((c) => ({ ...c }));
-    setRedoStack(prevRedo.slice(0, -1));
-    setHistory((h) => [...h, currentSnapshot]);
-    clipsRef.current = next;
-    setClips(next);
+    const nextRedo = prevRedo.slice(0, -1);
+    const nextHist = [...historyRef.current, currentSnapshot];
+    redoStackRef.current = nextRedo;
+    historyRef.current = nextHist;
+    setRedoStack(nextRedo);
+    setHistory(nextHist);
+    commitClips(next);
     if (isPlayingRef.current) startAudioAt(playheadRef.current);
-  }, [startAudioAt]);
+  }, [commitClips, startAudioAt]);
 
   const handleClearProject = useCallback(() => {
     if (isPlayingRef.current) togglePlay(false);
@@ -849,14 +861,16 @@ export function App() {
     });
     assetsMapRef.current.clear();
     setAssets([]);
-    setClips([]);
+    commitClips([]);
     setSelectedClipId(null);
+    historyRef.current = [];
+    redoStackRef.current = [];
     setHistory([]);
     setRedoStack([]);
     void clearAllRecoveryData();
     seekTo(0);
     showToast('เริ่มโปรเจกต์ใหม่แล้ว');
-  }, [seekTo, showToast, togglePlay]);
+  }, [commitClips, seekTo, showToast, togglePlay]);
 
   // Global Keyboard Shortcuts
   useEffect(() => {
@@ -1092,14 +1106,14 @@ export function App() {
             fadeIn: 0,
             fadeOut: 0,
           };
-          setClips((prev) => [...prev, imgClip]);
+          commitClips([...clipsRef.current, imgClip]);
           setSelectedClipId(imgClip.id);
           showToast('สร้างภาพนิ่ง 2 วินาทีแล้ว');
         };
         img.src = url;
       }, 'image/png');
     },
-    [pushHistory, showToast]
+    [commitClips, pushHistory, showToast]
   );
 
   // --- Detach Audio from Video ---
@@ -1157,8 +1171,8 @@ export function App() {
           fadeIn: 0,
           fadeOut: 0,
         };
-        setClips((prev) => [
-          ...prev.map((c) => (c.id === clipId ? { ...c, muted: true } : c)),
+        commitClips([
+          ...clipsRef.current.map((c) => (c.id === clipId ? { ...c, muted: true } : c)),
           audioClip,
         ]);
         setSelectedClipId(audioClip.id);
@@ -1167,7 +1181,7 @@ export function App() {
         showToast('วิดีโอนี้ไม่มีแทร็กเสียง หรือเบราว์เซอร์ไม่รองรับการถอดรหัส');
       }
     },
-    [ensureAudioCtx, pushHistory, showToast]
+    [commitClips, ensureAudioCtx, pushHistory, showToast]
   );
 
   // --- Mic Voiceover Recording ---
@@ -1289,10 +1303,10 @@ export function App() {
         return;
       }
       pushHistory(clipsRef.current);
-      setClips((prev) => [...prev, ...newSubs]);
+      commitClips([...clipsRef.current, ...newSubs]);
       showToast(`นำเข้าซับไตเติล ${newSubs.length} บรรทัดแล้ว`);
     },
-    [pushHistory, showToast]
+    [commitClips, pushHistory, showToast]
   );
 
   const handleExportSrt = useCallback(() => {
@@ -1348,7 +1362,7 @@ export function App() {
       try {
         const data = JSON.parse(await file.text());
         if (data.aspectRatio) setAspectRatio(data.aspectRatio);
-        if (data.colors) setColors({ ...DEFAULT_COLORS, ...data.colors });
+        if (data.colors) handleUpdateColors({ ...DEFAULT_COLORS, ...data.colors });
         if (data.exportSettings) setExportSettings(data.exportSettings);
         if (Array.isArray(data.clips)) {
           const manifest: Array<{ id: string; name: string }> = data.assetsManifest || [];
@@ -1362,14 +1376,14 @@ export function App() {
             ...c,
             mediaId: c.mediaId ? idMap.get(c.mediaId) ?? c.mediaId : null,
           }));
-          setClips(restored);
+          commitClips(restored);
           showToast('โหลดโปรเจกต์ .JSON แล้ว (นำเข้าไฟล์สื่อชื่อเดิมหากคลิปยังไม่ขึ้น)');
         }
       } catch {
         showToast('ไฟล์โปรเจกต์ .JSON ไม่ถูกต้อง');
       }
     },
-    [assets, pushHistory, showToast]
+    [assets, commitClips, handleUpdateColors, pushHistory, showToast]
   );
 
   const handleExportFcpxml = useCallback(() => {
@@ -1416,7 +1430,7 @@ export function App() {
       redo: handleRedo,
       clearProject: handleClearProject,
       addTextClip: handleAddTextClip,
-      updateColors: (patch) => setColors((prev) => ({ ...prev, ...patch })),
+      updateColors: handleUpdateColors,
       importFiles: handleImportFiles,
       importProject: handleImportProject,
       exportMp4: async () => {
@@ -1448,6 +1462,7 @@ export function App() {
     handleRippleDelete,
     handleSplit,
     handleUndo,
+    handleUpdateColors,
     seekTo,
     togglePlay,
   ]);
@@ -1623,7 +1638,7 @@ export function App() {
             y: 84,
           },
         }));
-      setClips((prev) => [...prev, ...subClips]);
+      commitClips([...clipsRef.current, ...subClips]);
       appendAiLog(`สร้างซับไตเติลสำเร็จ ${subClips.length} ช่วง!`);
       showToast(`สร้างซับไตเติล AI ${subClips.length} ช่วงแล้ว`);
     } catch (e) {
@@ -1633,7 +1648,7 @@ export function App() {
     } finally {
       setIsTranscribing(false);
     }
-  }, [appendAiLog, ensureAudioCtx, pushHistory, selectedClipId, showToast, whisperApiKey, whisperProvider]);
+  }, [appendAiLog, commitClips, ensureAudioCtx, pushHistory, selectedClipId, showToast, whisperApiKey, whisperProvider]);
 
   const handleAiSilenceCut = useCallback(() => {
     const audioClip =
@@ -1702,12 +1717,12 @@ export function App() {
         cursor += dur;
         return c;
       });
-      setClips((prev) => [...prev.filter((c) => c.id !== audioClip.id), ...newClips]);
+      commitClips([...clipsRef.current.filter((c) => c.id !== audioClip.id), ...newClips]);
       appendAiLog(`ตัดช่วงเงียบออกแล้ว เหลือ ${newClips.length} ท่อน`);
       showToast(`ตัดช่วงเงียบสำเร็จ (${newClips.length} ท่อน)`);
     };
     worker.postMessage({ samples: chData, sampleRate: sr }, [chData.buffer]);
-  }, [appendAiLog, pushHistory, selectedClipId, showToast]);
+  }, [appendAiLog, commitClips, pushHistory, selectedClipId, showToast]);
 
   const handleAiSplitHalf = useCallback(() => {
     const target =
@@ -1719,29 +1734,21 @@ export function App() {
     }
     pushHistory(clipsRef.current);
     const half = target.duration / 2;
-    const spd = target.speed || 1;
-    const left: TimelineClip = { ...target, duration: half };
-    const right: TimelineClip = {
-      ...target,
-      id: nextId('clip'),
-      timelineStart: target.timelineStart + half,
-      duration: target.duration - half,
-      sourceStart: target.sourceStart + half * spd,
-    };
-    setClips((prev) => [...prev.filter((c) => c.id !== target.id), left, right]);
+    const [left, right] = splitClipAtOffset(target, half, nextId('clip'));
+    commitClips([...clipsRef.current.filter((c) => c.id !== target.id), left, right]);
     appendAiLog(`แบ่งครึ่งคลิป "${target.name}" แล้ว`);
     showToast('แบ่งครึ่งคลิปวิดีโอแล้ว');
-  }, [appendAiLog, pushHistory, selectedClipId, showToast]);
+  }, [appendAiLog, commitClips, pushHistory, selectedClipId, showToast]);
 
   const handleAiAutoShorts = useCallback(() => {
     setAspectRatio('9:16');
     pushHistory(clipsRef.current);
-    setClips((prev) =>
-      prev.map((c) => (c.track === 'video' ? { ...c, scale: Math.max(c.scale, 178) } : c))
+    commitClips(
+      clipsRef.current.map((c) => (c.track === 'video' ? { ...c, scale: Math.max(c.scale, 178) } : c))
     );
     appendAiLog('ปรับสัดส่วนเป็นแนวตั้ง 9:16 (Shorts / TikTok) แล้ว');
     showToast('ปรับเป็นแนวตั้ง 9:16 (Shorts) แล้ว');
-  }, [appendAiLog, pushHistory, showToast]);
+  }, [appendAiLog, commitClips, pushHistory, showToast]);
 
   return (
     <div className="studio-shell" data-mobile-tab={mobileTab}>
@@ -1788,7 +1795,7 @@ export function App() {
           onImportFiles={handleImportFiles}
           onAddAssetToTimeline={(a) => addAssetToTimeline(a)}
           onAddTextClip={handleAddTextClip}
-          onUpdateColors={(patch) => setColors((prev) => ({ ...prev, ...patch }))}
+          onUpdateColors={handleUpdateColors}
           onImportSrt={handleImportSrt}
           onExportSrt={handleExportSrt}
           onExportProject={handleExportProject}
