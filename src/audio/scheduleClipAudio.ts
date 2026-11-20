@@ -85,11 +85,16 @@ export interface ScheduleParams {
   allClips: TimelineClip[];
 }
 
+export interface ScheduledAudioNodes {
+  source: AudioBufferSourceNode;
+  gain: GainNode;
+}
+
 /**
- * Schedules one clip's audio on a (realtime or offline) AudioContext.
- * Shared by preview playback and export so both sound identical.
+ * Schedules one clip's audio on a (realtime or offline) AudioContext and returns both
+ * source and gain nodes so callers can stop and disconnect the entire branch cleanly.
  */
-export function scheduleClipAudio(p: ScheduleParams): AudioBufferSourceNode | null {
+export function scheduleClipAudioNodes(p: ScheduleParams): ScheduledAudioNodes | null {
   const { ctx, destination, clip, buffer, playFrom, when, allClips } = p;
   if (playFrom >= clipEnd(clip) - 1e-4) return null;
 
@@ -126,7 +131,15 @@ export function scheduleClipAudio(p: ScheduleParams): AudioBufferSourceNode | nu
   src.connect(gain);
   gain.connect(destination);
   src.start(start, Math.max(0, srcOffset), remLt * spd);
-  return src;
+  return { source: src, gain };
+}
+
+/**
+ * Schedules one clip's audio on a (realtime or offline) AudioContext.
+ * Shared by preview playback and export so both sound identical.
+ */
+export function scheduleClipAudio(p: ScheduleParams): AudioBufferSourceNode | null {
+  return scheduleClipAudioNodes(p)?.source ?? null;
 }
 
 /** Clips whose audio should be heard: audio-track clips and un-muted video clips with decoded audio. */

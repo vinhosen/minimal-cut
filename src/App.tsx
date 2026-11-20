@@ -11,7 +11,9 @@ import { computeAudioPeaks, getCanvasDimensions, nextId } from './utils/timecode
 import { splitClipAtOffset } from './utils/clipTime';
 import { exportProjectToMp4, type ExportProgress } from './utils/exporter';
 import { exportViaRustEngine, isRustBackendAvailable, uploadMediaToRust } from './utils/rustBridge';
-import { audibleClips, scheduleClipAudio } from './audio/scheduleClipAudio';
+import { ensureAssetAudio } from './audio/scheduleClipAudio';
+import { TimelineClock } from './audio/TimelineClock';
+import { AudioScheduler } from './audio/AudioScheduler';
 import { VideoSyncController } from './engine/VideoSyncController';
 import { detectCapabilities } from './utils/capabilities';
 import {
@@ -115,7 +117,7 @@ export function App() {
   const noiseFilterRef = useRef<BiquadFilterNode | null>(null);
   const compressorRef = useRef<DynamicsCompressorNode | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
-  const activeAudioSourcesRef = useRef<AudioBufferSourceNode[]>([]);
+  const playRequestIdRef = useRef(0);
 
   const micRecorderRef = useRef<MediaRecorder | null>(null);
   const micChunksRef = useRef<Blob[]>([]);
@@ -238,22 +240,35 @@ export function App() {
     getVideoSync().setProxyMode(proxyMode);
   }, [getVideoSync, proxyMode]);
 
-  // Master playback clock: anchored to AudioContext time so picture follows sound exactly.
-  const clockRef = useRef({ timeline: 0, ctxTime: 0, perfTime: 0, useCtx: false });
-  const anchorClock = useCallback((timeline: number) => {
-    const ctx = audioCtxRef.current;
-    clockRef.current = {
-      timeline,
-      ctxTime: ctx?.currentTime ?? 0,
-      perfTime: performance.now(),
-      useCtx: Boolean(ctx && ctx.state === 'running'),
-    };
+  // Phase 2: Authoritative Master Clock anchored strictly to AudioContext.currentTime
+  const timelineClockRef = useRef<TimelineClock | null>(null);
+  const getTimelineClock = useCallback(() => {
+    if (!timelineClockRef.current) {
+      timelineClockRef.current = new TimelineClock();
+    }
+    return timelineClockRef.current;
   }, []);
-  const clockNow = useCallback(() => {
-    const c = clockRef.current;
-    const ctx = audioCtxRef.current;
-    if (c.useCtx && ctx && ctx.state === 'running') return c.timeline + (ctx.currentTime - c.ctxTime);
-    return c.timeline + (performance.now() - c.perfTime) / 1000;
+
+  // Phase 2: Deterministic 150ms lookahead Web Audio scheduler
+  const audioSchedulerRef = useRef<AudioScheduler | null>(null);
+  const getAudioScheduler = useCallback(() => {
+    if (!audioSchedulerRef.current) {
+      audioSchedulerRef.current = new AudioScheduler(getTimelineClock());
+    }
+    return audioSchedulerRef.current;
+  }, [getTimelineClock]);
+
+  // Immediate audio & video cleanup on component unmount
+  useEffect(() => {
+    return () => {
+      playRequestIdRef.current += 1;
+      audioSchedulerRef.current?.stopAll();
+      videoSyncRef.current?.reset();
+      renderClientRef.current?.reset();
+      if (audioCtxRef.current && audioCtxRef.current.state !== 'closed') {
+        audioCtxRef.current.close().catch(() => {});
+      }
+    };
   }, []);
 
   const drawNow = useCallback(
@@ -296,16 +311,8 @@ export function App() {
   }, [clips, colors, canvasDims, drawNow]);
 
   const stopAllAudio = useCallback(() => {
-    activeAudioSourcesRef.current.forEach((node) => {
-      try {
-        node.stop();
-        node.disconnect();
-      } catch {
-        // ignore
-      }
-    });
-    activeAudioSourcesRef.current = [];
-  }, []);
+    getAudioScheduler().stopAll();
+  }, [getAudioScheduler]);
 
   const ensureAudioCtx = useCallback(() => {
     if (!audioCtxRef.current) {
@@ -334,11 +341,12 @@ export function App() {
       compressorRef.current = comp;
       analyserRef.current = analyser;
     }
+    getTimelineClock().attach(audioCtxRef.current);
     if (audioCtxRef.current.state === 'suspended') {
       audioCtxRef.current.resume().catch(() => {});
     }
     return audioCtxRef.current;
-  }, []);
+  }, [getTimelineClock]);
 
   useEffect(() => {
     if (noiseFilterRef.current) {
@@ -347,38 +355,33 @@ export function App() {
   }, [colors.noiseReduce]);
 
   const startAudioAt = useCallback(
-    (timeSec: number) => {
-      stopAllAudio();
+    (reanchorSec?: number) => {
       const ctx = audioCtxRef.current;
-      if (!ctx) return;
-
-      const allClips = clipsRef.current;
-      const dest = masterGainRef.current || ctx.destination;
-      const when = ctx.currentTime;
-
-      for (const [clip, buffer] of audibleClips(allClips, assetsMapRef.current)) {
-        const node = scheduleClipAudio({
-          ctx,
-          destination: dest,
-          clip,
-          buffer,
-          playFrom: timeSec,
-          when,
-          allClips,
-        });
-        if (node) activeAudioSourcesRef.current.push(node);
+      if (!ctx || ctx.state === 'closed') return;
+      getTimelineClock().attach(ctx);
+      if (reanchorSec !== undefined) {
+        getTimelineClock().seek(reanchorSec);
       }
+      getAudioScheduler().restart(
+        ctx,
+        masterGainRef.current || ctx.destination,
+        clipsRef.current,
+        assetsMapRef.current
+      );
     },
-    [stopAllAudio]
+    [getAudioScheduler, getTimelineClock]
   );
 
   const syncVideoElements = useCallback(
     (time: number, forceSeek: boolean) => {
       const sync = getVideoSync();
+      // Phase 2 Guardrails: Always mute <video> so all audio runs exclusively through Web Audio,
+      // and slave video drift to the AudioContext Master Clock with a strict 80ms threshold.
+      const syncOpts = { driftThresholdSec: 0.08, alwaysMuteVideo: true };
       if (forceSeek) {
-        sync.seekDiscrete(time, clipsRef.current, isPlayingRef.current);
+        sync.seekDiscrete(time, clipsRef.current, isPlayingRef.current, syncOpts);
       } else {
-        sync.updatePlayback(time, clipsRef.current);
+        sync.updatePlayback(time, clipsRef.current, syncOpts);
       }
     },
     [getVideoSync]
@@ -389,55 +392,104 @@ export function App() {
       const clamped = Math.max(0, Math.min(time, totalDurationRef.current));
       playheadRef.current = clamped;
       setPlayhead(clamped);
-      anchorClock(clamped);
+      getTimelineClock().seek(clamped);
+      stopAllAudio();
       syncVideoElements(clamped, true);
-      if (isPlayingRef.current) startAudioAt(clamped);
+      if (isPlayingRef.current) startAudioAt();
       drawNow(clamped);
     },
-    [anchorClock, drawNow, startAudioAt, syncVideoElements]
+    [drawNow, getTimelineClock, startAudioAt, stopAllAudio, syncVideoElements]
   );
 
   const togglePlay = useCallback(
     (force?: boolean) => {
-      ensureAudioCtx();
+      const ctx = ensureAudioCtx();
       const total = totalDurationRef.current;
       if (total <= 0) {
         showToast('กรุณาเพิ่มคลิปลงไทม์ไลน์ก่อนเล่นครับ');
         return;
       }
       const next = force !== undefined ? force : !isPlayingRef.current;
-      if (next && playheadRef.current >= total) {
-        playheadRef.current = 0;
-        setPlayhead(0);
-      }
-      isPlayingRef.current = next;
-      setIsPlaying(next);
+      const reqId = ++playRequestIdRef.current;
 
-      if (next) {
-        anchorClock(playheadRef.current);
-        syncVideoElements(playheadRef.current, true);
-        startAudioAt(playheadRef.current);
-      } else {
+      if (!next) {
+        const frozen = getTimelineClock().pause();
+        isPlayingRef.current = false;
+        setIsPlaying(false);
+        playheadRef.current = Math.min(frozen, total);
+        setPlayhead(playheadRef.current);
         getVideoSync().pauseAll();
         stopAllAudio();
         setAudioDb('-∞ dB');
+        return;
+      }
+
+      if (playheadRef.current >= total) {
+        playheadRef.current = 0;
+        setPlayhead(0);
+      }
+
+      const startPlayback = () => {
+        if (playRequestIdRef.current !== reqId || ctx.state === 'closed') return;
+        const startPos = playheadRef.current;
+        isPlayingRef.current = true;
+        setIsPlaying(true);
+        getTimelineClock().attach(ctx);
+        getTimelineClock().start(startPos);
+        syncVideoElements(startPos, true);
+        getAudioScheduler().restart(
+          ctx,
+          masterGainRef.current || ctx.destination,
+          clipsRef.current,
+          assetsMapRef.current
+        );
+        // Ensure any un-decoded audio/video asset decodes into AudioBuffer and joins lookahead pump
+        assetsMapRef.current.forEach((asset) => {
+          if ((asset.type === 'video' || asset.type === 'audio') && !asset.audioBuffer && asset.audioStatus !== 'none') {
+            ensureAssetAudio(asset, ctx).then((buf) => {
+              if (!buf || !isPlayingRef.current) return;
+              getAudioScheduler().pump(
+                ctx,
+                masterGainRef.current || ctx.destination,
+                clipsRef.current,
+                assetsMapRef.current
+              );
+            });
+          }
+        });
+      };
+
+      if (ctx.state === 'suspended') {
+        ctx
+          .resume()
+          .then(startPlayback)
+          .catch(startPlayback);
+      } else {
+        startPlayback();
       }
     },
-    [anchorClock, ensureAudioCtx, getVideoSync, showToast, startAudioAt, stopAllAudio, syncVideoElements]
+    [ensureAudioCtx, getAudioScheduler, getTimelineClock, getVideoSync, showToast, stopAllAudio, syncVideoElements]
   );
 
-  // Playback rAF Loop driven by master AudioContext clock
+  // Playback rAF Loop driven exclusively by the AudioContext Master Clock (TimelineClock)
   useEffect(() => {
     let rafId = 0;
     let fpsCounter = 0;
-    let fpsTimer = performance.now();
-    let dbTimer = performance.now();
-    let uiPlayheadTimer = performance.now();
+    let fpsTimer = 0;
+    let dbTimer = 0;
+    let uiPlayheadTimer = 0;
     const dbData = new Uint8Array(128);
 
     const tick = (now: number) => {
+      if (fpsTimer === 0) {
+        fpsTimer = now;
+        dbTimer = now;
+        uiPlayheadTimer = now;
+      }
+
       if (isPlayingRef.current) {
-        let nextTime = clockNow();
+        const clock = getTimelineClock();
+        let nextTime = clock.getCurrentTime();
         const total = totalDurationRef.current;
 
         if (nextTime >= total) {
@@ -445,7 +497,7 @@ export function App() {
             nextTime = 0;
             playheadRef.current = 0;
             setPlayhead(0);
-            anchorClock(0);
+            clock.start(0);
             syncVideoElements(0, true);
             startAudioAt(0);
           } else {
@@ -456,7 +508,16 @@ export function App() {
           }
         } else {
           playheadRef.current = nextTime;
-          // Throttle React state updates to ~30Hz while rendering canvas at full 60-120Hz
+          // Pump the deterministic 150ms Web Audio lookahead scheduler
+          if (audioCtxRef.current) {
+            getAudioScheduler().pump(
+              audioCtxRef.current,
+              masterGainRef.current || audioCtxRef.current.destination,
+              clipsRef.current,
+              assetsMapRef.current
+            );
+          }
+          // Throttle React state updates to ~30Hz while canvas updates via rVFC/rAF at full refresh rate
           if (now - uiPlayheadTimer >= 32) {
             setPlayhead(nextTime);
             uiPlayheadTimer = now;
@@ -489,7 +550,7 @@ export function App() {
 
     rafId = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(rafId);
-  }, [anchorClock, clockNow, drawNow, startAudioAt, syncVideoElements, togglePlay]);
+  }, [drawNow, getAudioScheduler, getTimelineClock, startAudioAt, syncVideoElements, togglePlay]);
 
   // Fast Zero-Copy File Import (no IndexedDB blob blocking!)
   const addAssetToTimeline = useCallback(
@@ -626,7 +687,7 @@ export function App() {
               setAssets((prev) => prev.map((a) => (a.id === readyAsset.id ? { ...readyAsset } : a)));
               if (isPlayingRef.current) {
                 if (readyAsset.type === 'video') syncVideoElements(playheadRef.current, false);
-                startAudioAt(playheadRef.current);
+                startAudioAt();
               }
             },
           });
@@ -669,6 +730,7 @@ export function App() {
             onAudioReady: (readyAsset) => {
               if (!assetsMapRef.current.has(readyAsset.id)) return;
               setAssets((prev) => prev.map((a) => (a.id === readyAsset.id ? { ...readyAsset } : a)));
+              if (isPlayingRef.current) startAudioAt();
             },
           });
           assetsMapRef.current.set(asset.id, asset);
@@ -692,7 +754,7 @@ export function App() {
     } finally {
       setIsRestoringRecovery(false);
     }
-  }, [attachVideoEnhancements, commitClips, ensureAudioCtx, handleUpdateColors, recoveryCandidate, showToast]);
+  }, [attachVideoEnhancements, commitClips, ensureAudioCtx, handleUpdateColors, recoveryCandidate, showToast, startAudioAt]);
 
   const handleDiscardRecovery = useCallback(async () => {
     setRecoveryCandidate(null);
@@ -768,7 +830,7 @@ export function App() {
           'normalizeGain' in patch ||
           'audioKeyframes' in patch)
       ) {
-        startAudioAt(playheadRef.current);
+        startAudioAt();
       }
     },
     [commitClips, pushHistory, startAudioAt]
@@ -794,7 +856,7 @@ export function App() {
     const next = [...clipsRef.current.filter((c) => c.id !== target.id), leftClip, rightClip];
     commitClips(next);
     setSelectedClipId(rightClip.id);
-    if (isPlayingRef.current) startAudioAt(playheadRef.current);
+    if (isPlayingRef.current) startAudioAt();
     showToast('ตัดแบ่งคลิปแล้ว');
   }, [commitClips, pushHistory, selectedClipId, showToast, startAudioAt]);
 
@@ -804,7 +866,7 @@ export function App() {
     const next = clipsRef.current.filter((c) => c.id !== selectedClipId);
     commitClips(next);
     setSelectedClipId(null);
-    if (isPlayingRef.current) startAudioAt(playheadRef.current);
+    if (isPlayingRef.current) startAudioAt();
   }, [commitClips, pushHistory, selectedClipId, startAudioAt]);
 
   const handleRippleDelete = useCallback(() => {
@@ -822,7 +884,7 @@ export function App() {
       );
     commitClips(next);
     setSelectedClipId(null);
-    if (isPlayingRef.current) startAudioAt(playheadRef.current);
+    if (isPlayingRef.current) startAudioAt();
     showToast('ลบและเลื่อนคลิปมาชิดกันแล้ว');
   }, [commitClips, pushHistory, selectedClipId, showToast, startAudioAt]);
 
@@ -838,7 +900,7 @@ export function App() {
     setHistory(nextHist);
     setRedoStack(nextRedo);
     commitClips(last);
-    if (isPlayingRef.current) startAudioAt(playheadRef.current);
+    if (isPlayingRef.current) startAudioAt();
   }, [commitClips, startAudioAt]);
 
   const handleRedo = useCallback(() => {
@@ -853,11 +915,12 @@ export function App() {
     setRedoStack(nextRedo);
     setHistory(nextHist);
     commitClips(next);
-    if (isPlayingRef.current) startAudioAt(playheadRef.current);
+    if (isPlayingRef.current) startAudioAt();
   }, [commitClips, startAudioAt]);
 
   const handleClearProject = useCallback(() => {
     if (isPlayingRef.current) togglePlay(false);
+    stopAllAudio();
     videoSyncRef.current?.reset();
     renderClientRef.current?.reset();
     assetsMapRef.current.forEach((a) => {
@@ -875,7 +938,7 @@ export function App() {
     void clearAllRecoveryData();
     seekTo(0);
     showToast('เริ่มโปรเจกต์ใหม่แล้ว');
-  }, [commitClips, seekTo, showToast, togglePlay]);
+  }, [commitClips, seekTo, showToast, stopAllAudio, togglePlay]);
 
   // Global Keyboard Shortcuts
   useEffect(() => {

@@ -3,8 +3,8 @@ import { clipEnd, clipSourceTime, findActiveClip, findNextClip, isSeamlessContin
 
 /** How far ahead (seconds) we pre-roll the next clip on a standby element (once per clip). */
 const LOOKAHEAD_SEC = 1.5;
-/** Minimum cooldown (ms) between corrective drift seeks so the decoder can settle without stuttering. */
-const DRIFT_SEEK_COOLDOWN_MS = 250;
+/** Minimum cooldown (timeline seconds) between corrective drift seeks so the decoder can settle without stuttering. */
+const DRIFT_SEEK_COOLDOWN_SEC = 0.25;
 
 type VideoWithRVFC = HTMLVideoElement & {
   requestVideoFrameCallback?: (cb: (now: number, metadata: unknown) => void) => number;
@@ -44,7 +44,7 @@ export class VideoSyncController {
   private attached = new WeakSet<HTMLVideoElement>();
   private lastActiveClipId: string | null = null;
   private preRolledClipId: string | null = null;
-  private lastCorrectiveSeekMs = 0;
+  private lastCorrectiveSeekTimeline = -Infinity;
   private proxyMode = false;
 
   private vfcVideo: VideoWithRVFC | null = null;
@@ -306,16 +306,15 @@ export class VideoSyncController {
           const seamless = Boolean(prevClip && isSeamlessContinuation(prevClip, active));
           if (!seamless && Math.abs(activeEl.currentTime - tgt) > 0.04) {
             activeEl.currentTime = tgt;
-            this.lastCorrectiveSeekMs = performance.now();
+            this.lastCorrectiveSeekTimeline = time;
           }
         } else if (opts.driftThresholdSec !== undefined && !activeEl.seeking && activeEl.readyState >= 2) {
           // 2. Phase 2 Master Clock drift check (strict 80ms threshold + cooldown to prevent micro-stutter)
           const videoTimelineTime = active.timelineStart + (activeEl.currentTime - active.sourceStart) / spd;
           const drift = Math.abs(videoTimelineTime - time);
-          const nowMs = performance.now();
-          if (drift > opts.driftThresholdSec && nowMs - this.lastCorrectiveSeekMs >= DRIFT_SEEK_COOLDOWN_MS) {
+          if (drift > opts.driftThresholdSec && Math.abs(time - this.lastCorrectiveSeekTimeline) >= DRIFT_SEEK_COOLDOWN_SEC) {
             activeEl.currentTime = tgt;
-            this.lastCorrectiveSeekMs = nowMs;
+            this.lastCorrectiveSeekTimeline = time;
           }
         }
 
