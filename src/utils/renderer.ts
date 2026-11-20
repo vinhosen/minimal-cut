@@ -1,17 +1,32 @@
 import type { ColorSettings, MediaAsset, TimelineClip, VideoKeyframe } from '../types/editor';
 import { clamp } from './timecode';
 
-let offCanvas: HTMLCanvasElement | null = null;
-function getOffscreen(W: number, H: number): [HTMLCanvasElement, CanvasRenderingContext2D] {
-  if (!offCanvas) offCanvas = document.createElement('canvas');
+export type Canvas2DContext = CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D;
+export type FrameProvider = (clip: TimelineClip) => CanvasImageSource | undefined;
+
+export interface AssetDimensions {
+  width: number;
+  height: number;
+}
+
+let offCanvas: HTMLCanvasElement | OffscreenCanvas | null = null;
+function getOffscreen(W: number, H: number): [HTMLCanvasElement | OffscreenCanvas, Canvas2DContext] {
+  if (!offCanvas) {
+    if (typeof document !== 'undefined') {
+      offCanvas = document.createElement('canvas');
+    } else {
+      offCanvas = new OffscreenCanvas(W, H);
+    }
+  }
   if (offCanvas.width !== W || offCanvas.height !== H) {
     offCanvas.width = W;
     offCanvas.height = H;
   }
-  return [offCanvas, offCanvas.getContext('2d', { willReadFrequently: true })!];
+  const ctx = offCanvas.getContext('2d', { willReadFrequently: true }) as Canvas2DContext;
+  return [offCanvas, ctx];
 }
 
-function evalKeyframes(clip: TimelineClip, tLocal: number): VideoKeyframe {
+export function evalKeyframes(clip: TimelineClip, tLocal: number): VideoKeyframe {
   const kfs = clip.keyframes;
   if (!kfs || kfs.length === 0) {
     return { t: tLocal, x: clip.x, y: clip.y, scale: clip.scale, opacity: clip.opacity };
@@ -33,7 +48,7 @@ function evalKeyframes(clip: TimelineClip, tLocal: number): VideoKeyframe {
   return kfs[0];
 }
 
-function buildFilterString(colors: ColorSettings): string {
+export function buildFilterString(colors: ColorSettings): string {
   let base = `brightness(${colors.brightness}%) contrast(${colors.contrast}%) saturate(${colors.saturation}%)`;
   if (colors.blur > 0) base += ` blur(${colors.blur}px)`;
   if (colors.lut === 'vivid') {
@@ -49,12 +64,12 @@ function buildFilterString(colors: ColorSettings): string {
   return base;
 }
 
-function drawVisualLayer(
-  ctx: CanvasRenderingContext2D,
+export function drawVisualLayer(
+  ctx: Canvas2DContext,
   W: number,
   H: number,
   clip: TimelineClip,
-  el: HTMLVideoElement | HTMLImageElement,
+  el: CanvasImageSource,
   srcW: number,
   srcH: number,
   time: number,
@@ -112,8 +127,8 @@ function drawVisualLayer(
   ctx.restore();
 }
 
-function drawTextLayer(
-  ctx: CanvasRenderingContext2D,
+export function drawTextLayer(
+  ctx: Canvas2DContext,
   W: number,
   H: number,
   clip: TimelineClip,
@@ -185,7 +200,6 @@ function drawTextLayer(
     ctx.fillStyle = fx.color;
     ctx.fillText(txt, cx, cy);
   } else {
-    // subtitle
     ctx.lineWidth = Math.max(2, 4 * refScale);
     ctx.strokeStyle = fx.bgColor;
     ctx.lineJoin = 'round';
@@ -197,27 +211,57 @@ function drawTextLayer(
   ctx.restore();
 }
 
+export interface RenderOptions {
+  /** Element that currently holds the frame for a video clip (double-buffered preview). Defaults to asset.videoEl. */
+  videoSource?: (clip: TimelineClip) => HTMLVideoElement | undefined;
+  /** Generic frame source provider (VideoFrame / ImageBitmap / OffscreenCanvas) for worker or WebCodecs decode. */
+  frameProvider?: FrameProvider;
+  /**
+   * When true and the active video element has no decoded frame yet (e.g. mid-seek),
+   * nothing is drawn so the canvas keeps the previous good frame instead of flashing black.
+   */
+  holdIfNotReady?: boolean;
+}
+
+export function isVideoFrameReady(el: HTMLVideoElement | undefined): boolean {
+  return Boolean(el && el.readyState >= 2 && !el.seeking);
+}
+
+/** Returns false when the frame was skipped because the video source was not ready. */
 export function renderCompositionFrame(
-  ctx: CanvasRenderingContext2D,
+  ctx: Canvas2DContext,
   W: number,
   H: number,
   time: number,
   clips: TimelineClip[],
-  assets: Map<string, MediaAsset>,
+  assets: Map<string, MediaAsset | AssetDimensions>,
   colors: ColorSettings,
-  showCenterGuides = false
-) {
-  ctx.fillStyle = '#0f1115';
-  ctx.fillRect(0, 0, W, H);
-
-  // 1. Video Track
+  showCenterGuides = false,
+  opts: RenderOptions = {}
+): boolean {
   const activeVideo = clips.find(
     (c) => c.track === 'video' && time >= c.timelineStart && time < c.timelineStart + c.duration
   );
-  if (activeVideo && activeVideo.mediaId) {
-    const asset = assets.get(activeVideo.mediaId);
-    if (asset?.videoEl && asset.videoEl.readyState >= 2) {
-      drawVisualLayer(ctx, W, H, activeVideo, asset.videoEl, asset.width, asset.height, time, colors);
+  const videoAsset = activeVideo?.mediaId ? assets.get(activeVideo.mediaId) : undefined;
+  const providedVideoFrame = activeVideo ? opts.frameProvider?.(activeVideo) : undefined;
+  const mediaVideoAsset = videoAsset && 'videoEl' in videoAsset ? (videoAsset as MediaAsset) : undefined;
+  const videoEl =
+    activeVideo && !providedVideoFrame && mediaVideoAsset
+      ? (opts.videoSource?.(activeVideo) ?? mediaVideoAsset.videoEl)
+      : undefined;
+  const videoReady = Boolean(providedVideoFrame) || isVideoFrameReady(videoEl);
+
+  if (opts.holdIfNotReady && videoAsset && !videoReady) {
+    return false;
+  }
+
+  ctx.fillStyle = '#0f1115';
+  ctx.fillRect(0, 0, W, H);
+
+  if (activeVideo && videoAsset) {
+    const srcEl = providedVideoFrame ?? (videoEl && videoEl.readyState >= 2 ? videoEl : undefined);
+    if (srcEl) {
+      drawVisualLayer(ctx, W, H, activeVideo, srcEl, videoAsset.width, videoAsset.height, time, colors);
     }
   }
 
@@ -243,8 +287,12 @@ export function renderCompositionFrame(
   for (const imgClip of activeImages) {
     if (!imgClip.mediaId) continue;
     const asset = assets.get(imgClip.mediaId);
-    if (asset?.imgEl && asset.imgEl.complete) {
-      drawVisualLayer(ctx, W, H, imgClip, asset.imgEl, asset.width, asset.height, time, colors);
+    if (!asset) continue;
+    const providedImg = opts.frameProvider?.(imgClip);
+    const mediaImg = 'imgEl' in asset ? (asset as MediaAsset).imgEl : undefined;
+    const srcEl = providedImg ?? (mediaImg && mediaImg.complete ? mediaImg : undefined);
+    if (srcEl) {
+      drawVisualLayer(ctx, W, H, imgClip, srcEl, asset.width, asset.height, time, colors);
     }
   }
 
@@ -292,4 +340,5 @@ export function renderCompositionFrame(
     ctx.stroke();
     ctx.restore();
   }
+  return true;
 }

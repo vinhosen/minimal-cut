@@ -36,6 +36,7 @@ interface MediaSidebarProps {
   onExportSrt: () => void;
   onExportProject: () => void;
   onImportProject: (file: File) => void;
+  onExportFcpxml?: () => void;
   onToggleMicRecord: () => void;
   onChangeWhisperProvider: (p: 'gemini' | 'groq' | 'openai') => void;
   onChangeWhisperKey: (k: string) => void;
@@ -63,6 +64,7 @@ export const MediaSidebar: React.FC<MediaSidebarProps> = ({
   onExportSrt,
   onExportProject,
   onImportProject,
+  onExportFcpxml,
   onToggleMicRecord,
   onChangeWhisperProvider,
   onChangeWhisperKey,
@@ -112,7 +114,7 @@ export const MediaSidebar: React.FC<MediaSidebarProps> = ({
       <input
         ref={projInputRef}
         type="file"
-        accept=".json,application/json"
+        accept=".json,.fcproj,application/json"
         style={{ display: 'none' }}
         onChange={(e) => {
           if (e.target.files?.[0]) onImportProject(e.target.files[0]);
@@ -206,6 +208,8 @@ export const MediaSidebar: React.FC<MediaSidebarProps> = ({
                         </div>
                         <div className="asset-meta">
                           {asset.type === 'image' ? `${asset.width}×${asset.height}` : `${asset.duration.toFixed(1)} วิ`}
+                          {asset.proxyStatus === 'building' && ` • Proxy ${asset.proxyProgress ?? 0}%`}
+                          {asset.proxyStatus === 'ready' && ' • Proxy 540p'}
                         </div>
                       </div>
                       <button
@@ -221,7 +225,7 @@ export const MediaSidebar: React.FC<MediaSidebarProps> = ({
               </div>
 
               <div className="insp-section" style={{ borderTop: '1px solid var(--border-hairline)', paddingTop: 12, borderBottom: 'none' }}>
-                <div className="insp-heading">ไฟล์โปรเจกต์ (.JSON)</div>
+                <div className="insp-heading">ไฟล์โปรเจกต์ (.FCPROJ / .JSON / FCPXML)</div>
                 <div className="grid-2">
                   <button className="btn btn-secondary" onClick={onExportProject}>
                     <FileDown size={13} /> ส่งออกงาน
@@ -230,6 +234,16 @@ export const MediaSidebar: React.FC<MediaSidebarProps> = ({
                     <FileUp size={13} /> เปิดโปรเจกต์
                   </button>
                 </div>
+                {onExportFcpxml && (
+                  <button
+                    className="btn btn-secondary"
+                    style={{ width: '100%', marginTop: 6 }}
+                    onClick={onExportFcpxml}
+                    title="ส่งออกไทม์ไลน์เป็น Final Cut Pro XML (ใช้กับ FilmCraft, Premiere, DaVinci Resolve)"
+                  >
+                    <FileDown size={13} /> ส่งออก .FCPXML (FilmCraft)
+                  </button>
+                )}
               </div>
             </>
           )}

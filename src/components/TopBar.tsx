@@ -1,6 +1,7 @@
 import React from 'react';
-import { Scissors, Undo2, Redo2, Download, Trash2 } from 'lucide-react';
+import { Scissors, Undo2, Redo2, Download, Trash2, HardDrive } from 'lucide-react';
 import type { ExportFps, ExportResolution } from '../types/editor';
+import type { Capabilities } from '../utils/capabilities';
 
 interface TopBarProps {
   fps: ExportFps;
@@ -9,6 +10,8 @@ interface TopBarProps {
   canRedo: boolean;
   hasClips: boolean;
   webCodecsSupported: boolean;
+  capabilities?: Capabilities;
+  autosaveLabel?: string;
   onUndo: () => void;
   onRedo: () => void;
   onClearProject: () => void;
@@ -22,12 +25,26 @@ export const TopBar: React.FC<TopBarProps> = ({
   canRedo,
   hasClips,
   webCodecsSupported,
+  capabilities,
+  autosaveLabel,
   onUndo,
   onRedo,
   onClearProject,
   onOpenExport,
 }) => {
   const resLabel = resolution === 2160 ? '4K' : resolution === 1440 ? '2K' : `${resolution}p`;
+
+  const capSummary = capabilities
+    ? [
+        `Engine: FilmCraft ${capabilities.engine.toUpperCase()} (${capabilities.compositor.toUpperCase()})`,
+        `WebCodecs Encode: ${capabilities.webCodecsEncode ? 'พร้อม' : 'ไม่รองรับ'}`,
+        `WebCodecs Decode: ${capabilities.webCodecsDecode ? 'พร้อม' : 'Fallback'}`,
+        `OPFS Storage: ${capabilities.opfs ? 'พร้อม' : 'IndexedDB Fallback'}`,
+        `COOP/COEP Isolated: ${capabilities.crossOriginIsolated ? 'ใช่' : 'ไม่ใช่'}`,
+      ].join(' • ')
+    : webCodecsSupported
+      ? 'พร้อม Export 120 FPS แบบ Offline'
+      : 'ใช้ MediaRecorder';
 
   return (
     <header className="topbar">
@@ -39,10 +56,22 @@ export const TopBar: React.FC<TopBarProps> = ({
           <span>MinimalCut</span>
         </div>
         <div className="topbar-divider hide-mobile" />
-        <div className="status-pill hide-mobile" title={webCodecsSupported ? 'พร้อม Export 120 FPS แบบ Offline' : 'ใช้ MediaRecorder'}>
+        <div className="status-pill hide-mobile" title={capSummary}>
           <span className="status-dot" />
-          <span>{webCodecsSupported ? 'WebCodecs พร้อมใช้' : 'โหมดมาตรฐาน'}</span>
+          <span>
+            {webCodecsSupported
+              ? capabilities?.webgl2
+                ? 'FilmCraft GPU + WebCodecs'
+                : 'WebCodecs พร้อมใช้'
+              : 'โหมดมาตรฐาน'}
+          </span>
         </div>
+        {autosaveLabel && (
+          <div className="status-pill hide-mobile" title="ระบบบันทึกอัตโนมัติ (FilmCraft OPFS / IndexedDB)">
+            <HardDrive size={12} />
+            <span>{autosaveLabel}</span>
+          </div>
+        )}
       </div>
 
       <div className="topbar-center">
@@ -70,7 +99,9 @@ export const TopBar: React.FC<TopBarProps> = ({
         </button>
         <button className="btn btn-dark" onClick={onOpenExport} disabled={!hasClips}>
           <Download size={14} />
-          <span>Export<span className="hide-xs"> วิดีโอ</span></span>
+          <span>
+            Export<span className="hide-xs"> วิดีโอ</span>
+          </span>
         </button>
       </div>
     </header>
