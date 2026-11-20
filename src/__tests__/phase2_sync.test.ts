@@ -339,4 +339,50 @@ describe('Phase 2 — Authoritative AudioContext Master Clock, Lookahead Schedul
     expect(standbyVideo.setCurrentTimeSpy).toHaveBeenCalledTimes(1);
     expect(standbyVideo.setCurrentTimeSpy).toHaveBeenLastCalledWith(12);
   });
+
+  it('routes active video audio via connectElementAudio fallback when AudioBuffer is unavailable, and mutes video once AudioBuffer is ready', () => {
+    const standbyVideo = makeMockVideoEl(0);
+    globalThis.document = {
+      createElement: vi.fn(() => standbyVideo.el),
+    } as unknown as Document;
+
+    const mainVideo = makeMockVideoEl(0);
+    const asset: MediaAsset = {
+      id: 'm1',
+      name: 'clip.mp4',
+      type: 'video',
+      file: new File([], 'clip.mp4'),
+      url: 'blob:test',
+      duration: 20,
+      width: 1920,
+      height: 1080,
+      videoEl: mainVideo.el,
+      audioStatus: 'none',
+    };
+    const assets = new Map<string, MediaAsset>([['m1', asset]]);
+    const c1 = makeClip({ id: 'c1', timelineStart: 0, duration: 5, sourceStart: 0, volume: 80 });
+    const ctrl = new VideoSyncController(() => assets, vi.fn());
+    const connectElementAudio = vi.fn(() => true);
+
+    // 1. Without AudioBuffer: routes through Web Audio bridge and leaves element unmuted so samples flow
+    ctrl.seekDiscrete(0, [c1], true, {
+      driftThresholdSec: 0.08,
+      alwaysMuteVideo: true,
+      connectElementAudio,
+    });
+    expect(connectElementAudio).toHaveBeenCalledWith(mainVideo.el, true, 0.8);
+    expect(mainVideo.el.muted).toBe(false);
+
+    // 2. Once AudioBuffer becomes ready: mutes underlying <video> element and zeroes fallback bridge gain
+    asset.audioBuffer = { duration: 20, numberOfChannels: 2, length: 960000, sampleRate: 48000 } as AudioBuffer;
+    asset.audioStatus = 'ready';
+    mainVideo.advanceRaw(0.2);
+    ctrl.updatePlayback(0.2, [c1], {
+      driftThresholdSec: 0.08,
+      alwaysMuteVideo: true,
+      connectElementAudio,
+    });
+    expect(connectElementAudio).toHaveBeenLastCalledWith(mainVideo.el, false, 0);
+    expect(mainVideo.el.muted).toBe(true);
+  });
 });

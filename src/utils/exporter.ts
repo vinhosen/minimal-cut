@@ -362,6 +362,46 @@ async function pickSupportedVideoConfig(
   return null;
 }
 
+interface SupportedAudioEncoderConfig {
+  encoderCodec: string;
+  muxerCodec: 'aac' | 'opus';
+  bitrate?: number;
+  label: string;
+}
+
+async function pickSupportedAudioConfig(
+  sampleRate = 48000,
+  numberOfChannels = 2
+): Promise<SupportedAudioEncoderConfig | null> {
+  if (typeof window === 'undefined' || !('AudioEncoder' in window) || !('AudioData' in window)) {
+    return null;
+  }
+
+  const candidates: SupportedAudioEncoderConfig[] = [
+    { encoderCodec: 'mp4a.40.2', muxerCodec: 'aac', bitrate: 192_000, label: 'AAC' },
+    { encoderCodec: 'mp4a.40.2', muxerCodec: 'aac', bitrate: 128_000, label: 'AAC' },
+    { encoderCodec: 'mp4a.40.2', muxerCodec: 'aac', label: 'AAC' },
+    { encoderCodec: 'opus', muxerCodec: 'opus', bitrate: 192_000, label: 'Opus' },
+    { encoderCodec: 'opus', muxerCodec: 'opus', bitrate: 128_000, label: 'Opus' },
+    { encoderCodec: 'opus', muxerCodec: 'opus', label: 'Opus' },
+  ];
+
+  for (const cand of candidates) {
+    try {
+      const res = await AudioEncoder.isConfigSupported({
+        codec: cand.encoderCodec,
+        numberOfChannels,
+        sampleRate,
+        ...(cand.bitrate ? { bitrate: cand.bitrate } : {}),
+      });
+      if (res.supported) return cand;
+    } catch {
+      // try next candidate
+    }
+  }
+  return null;
+}
+
 function createExportCanvas(width: number, height: number): {
   canvas: OffscreenCanvas | HTMLCanvasElement;
   ctx: Canvas2DContext;
@@ -502,23 +542,12 @@ export async function exportProjectToMp4(params: {
   const mixedAudio = await renderMixedAudioBuffer(totalDuration, clips, assets);
   checkAborted();
 
-  let hasAudioEncoder = false;
-  if (mixedAudio && 'AudioEncoder' in window && 'AudioData' in window) {
-    try {
-      const audioSupport = await AudioEncoder.isConfigSupported({
-        codec: 'mp4a.40.2',
-        numberOfChannels: 2,
-        sampleRate: 48000,
-        bitrate: 192_000,
-      });
-      hasAudioEncoder = Boolean(audioSupport.supported);
-    } catch {
-      hasAudioEncoder = false;
-    }
-  }
+  const audioConfig = mixedAudio ? await pickSupportedAudioConfig(48000, 2) : null;
+  const hasAudioEncoder = Boolean(mixedAudio && audioConfig);
   checkAborted();
 
-  const expectedAudioChunks = hasAudioEncoder && mixedAudio ? Math.ceil(mixedAudio.length / 1024) + 32 : 0;
+  const audioChunkFrames = audioConfig?.muxerCodec === 'opus' ? 960 : 1024;
+  const expectedAudioChunks = hasAudioEncoder && mixedAudio ? Math.ceil(mixedAudio.length / audioChunkFrames) + 32 : 0;
 
   // Unified lifecycle variables guarded by try/catch/finally so zero streams, OPFS files,
   // encoders, or dedicated export <video> elements can ever leak on error or abort.
@@ -589,9 +618,9 @@ export async function exportProjectToMp4(params: {
         width: W,
         height: H,
       },
-      audio: hasAudioEncoder
+      audio: audioConfig
         ? {
-            codec: 'aac',
+            codec: audioConfig.muxerCodec,
             numberOfChannels: 2,
             sampleRate: 48000,
           }
@@ -629,11 +658,11 @@ export async function exportProjectToMp4(params: {
       latencyMode: videoConfig.latencyMode,
     });
 
-    // 1. Offline Audio Encoding (aligned to microsecond epoch 0 µs; safely normalizes negative AAC priming timestamps)
-    if (hasAudioEncoder && mixedAudio) {
+    // 1. Offline Audio Encoding (aligned to microsecond epoch 0 µs; safely normalizes negative priming timestamps)
+    if (audioConfig && mixedAudio) {
       onProgress({
         percent: 5,
-        message: 'กำลังเข้ารหัสเสียง AAC (OfflineAudioContext)...',
+        message: `กำลังเข้ารหัสเสียง ${audioConfig.label} (OfflineAudioContext)...`,
         currentFrame: 0,
         totalFrames,
       });
@@ -663,15 +692,15 @@ export async function exportProjectToMp4(params: {
 
       try {
         audioEncoder.configure({
-          codec: 'mp4a.40.2',
+          codec: audioConfig.encoderCodec,
           numberOfChannels: 2,
           sampleRate: 48000,
-          bitrate: 192_000,
+          ...(audioConfig.bitrate ? { bitrate: audioConfig.bitrate } : {}),
         });
 
         const ch0 = mixedAudio.getChannelData(0);
         const ch1 = mixedAudio.numberOfChannels > 1 ? mixedAudio.getChannelData(1) : ch0;
-        const chunkFrames = 1024;
+        const chunkFrames = audioChunkFrames;
         for (let offset = 0; offset < mixedAudio.length; offset += chunkFrames) {
           checkAborted();
           if (audioEncoderError) throw audioEncoderError;
