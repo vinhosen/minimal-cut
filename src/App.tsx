@@ -8,7 +8,6 @@ import type {
   TimelineClip,
 } from './types/editor';
 import { computeAudioPeaks, getCanvasDimensions, nextId } from './utils/timecode';
-import { renderCompositionFrame } from './utils/renderer';
 import { exportProjectToMp4, type ExportProgress } from './utils/exporter';
 import { exportViaRustEngine, isRustBackendAvailable, uploadMediaToRust } from './utils/rustBridge';
 import { audibleClips, scheduleClipAudio } from './audio/scheduleClipAudio';
@@ -24,6 +23,9 @@ import {
 } from './storage/projectDb';
 import { useAutosave } from './hooks/useAutosave';
 import { createAssetFromFile } from './media/createAsset';
+import { generateVideoProxy, shouldBuildAutoProxy } from './media/proxy';
+import { RenderClient } from './engine/RenderClient';
+import { exportToFcpxml, installFilmCraftWebApi } from './filmcraft/api';
 import { RecoveryDialog } from './components/RecoveryDialog';
 import { Film, FolderPlus, SlidersHorizontal } from 'lucide-react';
 import { TopBar } from './components/TopBar';
@@ -194,7 +196,7 @@ export function App() {
     setRedoStack([]);
   }, []);
 
-  // Forward-declared so the video controller can request a redraw once a seek lands.
+  // Forward-declared so the video controller and WebCodecs decoder can request a redraw once a frame lands.
   const drawNowRef = useRef<(time: number) => void>(() => {});
   const videoSyncRef = useRef<VideoSyncController | null>(null);
   const getVideoSync = useCallback(() => {
@@ -208,6 +210,20 @@ export function App() {
     }
     return videoSyncRef.current;
   }, []);
+
+  const renderClientRef = useRef<RenderClient | null>(null);
+  const getRenderClient = useCallback(() => {
+    if (!renderClientRef.current) {
+      renderClientRef.current = new RenderClient(() => {
+        if (!isPlayingRef.current) drawNowRef.current(playheadRef.current);
+      });
+    }
+    return renderClientRef.current;
+  }, []);
+
+  useEffect(() => {
+    getVideoSync().setProxyMode(proxyMode);
+  }, [getVideoSync, proxyMode]);
 
   // Master playback clock: anchored to AudioContext time so picture follows sound exactly.
   const clockRef = useRef({ timeline: 0, ctxTime: 0, perfTime: 0, useCtx: false });
@@ -234,20 +250,20 @@ export function App() {
       const ctx = canvas.getContext('2d', { alpha: false });
       if (!ctx) return;
       const sync = getVideoSync();
-      renderCompositionFrame(
+      getRenderClient().render({
         ctx,
-        canvas.width,
-        canvas.height,
+        width: canvas.width,
+        height: canvas.height,
         time,
-        clipsRef.current,
-        assetsMapRef.current,
-        colorsRef.current,
-        isDraggingPreviewRef.current,
-        // Hold the last good frame while a video is seeking instead of flashing black.
-        { videoSource: (clip) => sync.elementFor(clip), holdIfNotReady: true }
-      );
+        isPlaying: isPlayingRef.current,
+        clips: clipsRef.current,
+        assets: assetsMapRef.current,
+        colors: colorsRef.current,
+        showCenterGuides: isDraggingPreviewRef.current,
+        videoSource: (clip) => sync.elementFor(clip),
+      });
     },
-    [getVideoSync]
+    [getRenderClient, getVideoSync]
   );
 
   useEffect(() => {
@@ -562,6 +578,20 @@ export function App() {
     [pushHistory]
   );
 
+  const attachVideoEnhancements = useCallback(
+    (asset: MediaAsset) => {
+      if (asset.type !== 'video') return;
+      getRenderClient().registerAsset(asset);
+      if (shouldBuildAutoProxy(asset)) {
+        void generateVideoProxy(asset, (patch) => {
+          Object.assign(asset, patch);
+          setAssets((prev) => prev.map((a) => (a.id === asset.id ? { ...asset } : a)));
+        });
+      }
+    },
+    [getRenderClient]
+  );
+
   const handleImportFiles = useCallback(
     async (fileList: FileList | File[]) => {
       for (const file of Array.from(fileList)) {
@@ -579,6 +609,7 @@ export function App() {
           assetsMapRef.current.set(asset.id, asset);
           setAssets((prev) => [...prev, asset]);
           addAssetToTimeline(asset);
+          attachVideoEnhancements(asset);
           showToast(`นำเข้า "${file.name}" แล้ว`);
 
           // Persist media file in background to FilmCraft OPFS / IndexedDB for crash recovery
@@ -594,7 +625,7 @@ export function App() {
         }
       }
     },
-    [addAssetToTimeline, ensureAudioCtx, showToast, startAudioAt, syncVideoElements]
+    [addAssetToTimeline, attachVideoEnhancements, ensureAudioCtx, showToast, startAudioAt, syncVideoElements]
   );
 
   const handleRestoreRecovery = useCallback(async () => {
@@ -616,6 +647,7 @@ export function App() {
             },
           });
           assetsMapRef.current.set(asset.id, asset);
+          attachVideoEnhancements(asset);
           restoredAssets.push(asset);
         } catch {
           // skip unreadable media
@@ -636,7 +668,7 @@ export function App() {
     } finally {
       setIsRestoringRecovery(false);
     }
-  }, [ensureAudioCtx, recoveryCandidate, showToast]);
+  }, [attachVideoEnhancements, ensureAudioCtx, recoveryCandidate, showToast]);
 
   const handleDiscardRecovery = useCallback(async () => {
     setRecoveryCandidate(null);
@@ -810,7 +842,11 @@ export function App() {
   const handleClearProject = useCallback(() => {
     if (isPlayingRef.current) togglePlay(false);
     videoSyncRef.current?.reset();
-    assetsMapRef.current.forEach((a) => URL.revokeObjectURL(a.url));
+    renderClientRef.current?.reset();
+    assetsMapRef.current.forEach((a) => {
+      URL.revokeObjectURL(a.url);
+      if (a.proxyUrl) URL.revokeObjectURL(a.proxyUrl);
+    });
     assetsMapRef.current.clear();
     setAssets([]);
     setClips([]);
@@ -897,6 +933,7 @@ export function App() {
           totalDuration,
           signal: abort.signal,
           onProgress: setExportProgress,
+          decodeFrame: (asset, srcT) => getRenderClient().decodeFrameForExport(asset, srcT),
         });
 
         if (!res.savedDirectly) {
@@ -1335,6 +1372,86 @@ export function App() {
     [assets, pushHistory, showToast]
   );
 
+  const handleExportFcpxml = useCallback(() => {
+    const [w, h] = canvasDims;
+    const xml = exportToFcpxml({
+      fps: exportSettings.fps,
+      width: w,
+      height: h,
+      totalDuration: totalDurationRef.current,
+      clips: clipsRef.current,
+      assets,
+    });
+    const blob = new Blob([xml], { type: 'application/xml;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `MinimalCut_FilmCraft_${Date.now()}.fcpxml`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+    showToast('ส่งออกไฟล์ .FCPXML (FilmCraft / Final Cut Pro) แล้ว');
+  }, [assets, canvasDims, exportSettings.fps, showToast]);
+
+  // Install FilmCraft Web Control & Agent API (`window.filmcraft`)
+  useEffect(() => {
+    installFilmCraftWebApi({
+      getState: () => ({
+        clips: clipsRef.current,
+        assets: Array.from(assetsMapRef.current.values()),
+        colors: colorsRef.current,
+        aspectRatio,
+        exportSettings,
+        playhead: playheadRef.current,
+        totalDuration: totalDurationRef.current,
+        isPlaying: isPlayingRef.current,
+        capabilities,
+        canvas: canvasRef.current,
+      }),
+      togglePlay,
+      seekTo,
+      split: handleSplit,
+      deleteSelected: handleDelete,
+      rippleDeleteSelected: handleRippleDelete,
+      undo: handleUndo,
+      redo: handleRedo,
+      clearProject: handleClearProject,
+      addTextClip: handleAddTextClip,
+      updateColors: (patch) => setColors((prev) => ({ ...prev, ...patch })),
+      importFiles: handleImportFiles,
+      importProject: handleImportProject,
+      exportMp4: async () => {
+        const res = await exportProjectToMp4({
+          clips: clipsRef.current,
+          assets: assetsMapRef.current,
+          colors: colorsRef.current,
+          aspectRatio,
+          settings: exportSettings,
+          totalDuration: Math.max(0.5, totalDurationRef.current),
+          signal: new AbortController().signal,
+          onProgress: () => {},
+          decodeFrame: (asset, srcT) => getRenderClient().decodeFrameForExport(asset, srcT),
+        });
+        return { blob: res.blob, filename: res.filename };
+      },
+    });
+  }, [
+    aspectRatio,
+    capabilities,
+    exportSettings,
+    getRenderClient,
+    handleAddTextClip,
+    handleClearProject,
+    handleDelete,
+    handleImportFiles,
+    handleImportProject,
+    handleRedo,
+    handleRippleDelete,
+    handleSplit,
+    handleUndo,
+    seekTo,
+    togglePlay,
+  ]);
+
   // --- AI & Auto Tools ---
   const handleAiAutoSub = useCallback(async () => {
     if (!whisperApiKey.trim()) {
@@ -1676,6 +1793,7 @@ export function App() {
           onExportSrt={handleExportSrt}
           onExportProject={handleExportProject}
           onImportProject={handleImportProject}
+          onExportFcpxml={handleExportFcpxml}
           onToggleMicRecord={handleToggleMicRecord}
           onChangeWhisperProvider={(p) => {
             setWhisperProvider(p);

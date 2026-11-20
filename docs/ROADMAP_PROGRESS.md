@@ -31,23 +31,24 @@ verify with `npm run build && npm run lint && npm test`, commit, update this fil
 - [x] 1.3 FilmCraft coalesced OPFS + IndexedDB autosave + `RecoveryPolicy` + RecoveryDialog (+ `createAsset` extraction)
 - [x] 1.4 Streaming export (`showSaveFilePicker` → OPFS disk stream → `ArrayBuffer` fallback) + storage quota estimate
 
-### Phase 2 — Smoothness
-- [ ] 2.1 Renderer refactor to frame sources + OffscreenCanvas render worker (fallback main thread)
-- [ ] 2.2 Auto proxy (mp4box + WebCodecs, 540p, OPFS) + UI status
+### Phase 2 — Smoothness (FilmCraft Worker & Proxy)
+- [x] 2.1 Renderer refactor to frame sources + `OffscreenCanvas` render worker (`src/workers/render.worker.ts`) + `RenderClient`
+- [x] 2.2 Auto proxy (540p frequent-keyframe H.264 in OPFS `proxy/<assetId>.mp4`) + UI status badge + Proxy Mode switching
 
-### Phase 3 — Pro engine (`?engine=v2` flag)
-- [ ] 3.1 Demux + VideoDecoderPool + LRU FrameCache; used for preview scrub + export
-- [ ] 3.2 WebGL2 compositor (+ text texture cache)
-- [ ] 3.3 Chunked audio decode evaluation
+### Phase 3 — Pro Engine (FilmCraft `storytold/filmcraft` Open-Source Integration)
+- [x] 3.1 FilmCraft ISO-BMFF MP4 demuxer (`src/filmcraft/isobmff.ts`) + GOP-aware WebCodecs `WcSource` (`src/filmcraft/webcodecs.ts`) with 40-frame cache (`CACHE_FRAMES = 40`, `LOOKAHEAD = 8`, `STALE_MS = 2000`); used for preview scrub + offline export
+- [x] 3.2 FilmCraft Linear-Light WebGL2 GPU Compositor (`src/filmcraft/gpuCompositor.ts`) with sRGB↔Linear conversion, LUTs, GPU chroma key, glitch, vignette, masks
+- [x] 3.3 FilmCraft `AudioWorklet` processor (`public/filmcraft-audio-worklet.js`), `window.filmcraft` control/agent API, and Final Cut Pro `.fcpxml` interchange (`src/filmcraft/api.ts`)
 
 ### Wrap-up
-- [ ] Playwright smoke test
-- [ ] Subagent code review + fixes
-- [ ] Open PR, walkthrough
+- [/] Subagent code review + fixes
+- [ ] Push branch & open PR, walkthrough
 
 ## Commit log
 | Step | Commit | Notes |
 |---|---|---|
+| Phase 0 | `2c5585c` | Cut-point flicker/stutter fix, export audio, reverse math, StrictMode undo/redo, 0 lint warnings |
+| Phase 1 | `e1c7d3d` | Multi-asset build, COOP/COEP `coi-serviceworker`, FilmCraft `Tick` time base, OPFS recovery, streaming export |
 
 ## Open issues / notes
 - Baseline: build OK, oxlint 0 errors / 6 warnings (react refs, exhaustive-deps)

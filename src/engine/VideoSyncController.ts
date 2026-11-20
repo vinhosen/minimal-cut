@@ -45,17 +45,43 @@ export class VideoSyncController {
     el.addEventListener('loadeddata', this.onFrameReady);
   }
 
+  private proxyMode = false;
+
+  setProxyMode(enabled: boolean) {
+    if (this.proxyMode === enabled) return;
+    this.proxyMode = enabled;
+    this.getAssets().forEach((asset) => {
+      if (asset.type !== 'video' || !asset.videoEl) return;
+      const targetSrc = enabled && asset.proxyUrl ? asset.proxyUrl : asset.url;
+      for (const el of [asset.videoEl, this.standby.get(asset.id)]) {
+        if (el && el.src !== targetSrc) {
+          const curTime = el.currentTime;
+          const wasPlaying = !el.paused;
+          el.src = targetSrc;
+          el.currentTime = curTime;
+          if (wasPlaying) el.play().catch(() => {});
+        }
+      }
+    });
+  }
+
   private elementsOf(asset: MediaAsset): HTMLVideoElement[] {
     if (!asset.videoEl) return [];
+    const targetSrc = this.proxyMode && asset.proxyUrl ? asset.proxyUrl : asset.url;
+    if (asset.videoEl.src !== targetSrc) {
+      asset.videoEl.src = targetSrc;
+    }
     this.attach(asset.videoEl);
     let sb = this.standby.get(asset.id);
     if (!sb) {
       sb = document.createElement('video');
-      sb.src = asset.url;
+      sb.src = targetSrc;
       sb.playsInline = true;
       sb.muted = true;
       this.attach(sb);
       this.standby.set(asset.id, sb);
+    } else if (sb.src !== targetSrc) {
+      sb.src = targetSrc;
     }
     return [asset.videoEl, sb];
   }
