@@ -6,10 +6,12 @@
  * - Steps offline frame-by-frame by exact non-drifting microsecond intervals:
  *   `dt = 1 / fps`, `timestampUs = Math.round(frameIndex * (1_000_000 / fps))`.
  * - Awaits explicit seek + decode completion (`seeked` + `readyState >= 2` + frame settle)
- *   for every active video clip before compositing onto a dedicated `OffscreenCanvas`.
- * - Immediately calls `.close()` on every `VideoFrame` and `AudioData` after `.encode()`.
+ *   on dedicated full-resolution export `<video>` elements (immune to Proxy Mode & preview side-effects)
+ *   before compositing onto a dedicated `OffscreenCanvas`.
+ * - Immediately calls `.close()` on every `VideoFrame`, `AudioData`, and decoded override frame.
  * - Renders timeline audio offline via `OfflineAudioContext`, encodes AAC `AudioData` aligned
- *   to the same microsecond epoch, flushes both encoders, and finalizes `mp4-muxer`.
+ *   to the same microsecond epoch (safely handling platform AAC negative priming timestamps),
+ *   flushes both encoders, and finalizes `mp4-muxer` inside a unified abort/cleanup lifecycle.
  */
 
 import { Muxer, ArrayBufferTarget, FileSystemWritableFileStreamTarget } from 'mp4-muxer';
@@ -97,24 +99,76 @@ type VideoWithRVFC = HTMLVideoElement & {
   cancelVideoFrameCallback?: (handle: number) => void;
 };
 
+/** Wait until a newly created export `<video>` element has loaded metadata (`readyState >= 1`). */
+function waitForVideoMetadata(video: HTMLVideoElement, signal?: AbortSignal): Promise<void> {
+  if (video.readyState >= 1) return Promise.resolve();
+  if (signal?.aborted) return Promise.reject(new Error('ยกเลิกการบันทึกแล้ว'));
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => {
+      video.removeEventListener('loadedmetadata', onReady);
+      video.removeEventListener('loadeddata', onReady);
+      video.removeEventListener('error', onError);
+      signal?.removeEventListener('abort', onAbort);
+      clearTimeout(timer);
+    };
+    const onReady = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve();
+    };
+    const onError = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(new Error('ไม่สามารถโหลดไฟล์วิดีโอต้นฉบับสำหรับการ Export ได้'));
+    };
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(new Error('ยกเลิกการบันทึกแล้ว'));
+    };
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (video.readyState >= 1) resolve();
+      else reject(new Error('หมดเวลารอโหลดข้อมูลเมตาดาตาของวิดีโอสำหรับการ Export'));
+    }, 5000);
+
+    signal?.addEventListener('abort', onAbort, { once: true });
+    video.addEventListener('loadedmetadata', onReady);
+    video.addEventListener('loadeddata', onReady);
+    video.addEventListener('error', onError);
+  });
+}
+
 /**
  * Explicitly seeks a paused `HTMLVideoElement` to `targetTime` and waits for:
- * 1. `seeked` event completion
- * 2. `video.readyState >= 2 && !video.seeking` (`loadeddata`/`canplay` if needed)
- * 3. Frame decode/compositor settle (`requestVideoFrameCallback` if fired during paused seek,
- *    or one `requestAnimationFrame` settle tick so decoded pixels are guaranteed uploaded).
+ * 1. Metadata readiness (`readyState >= 1`)
+ * 2. `seeked` event completion
+ * 3. `video.readyState >= 2 && !video.seeking` (`loadeddata`/`canplay` if needed)
+ * 4. Frame decode/compositor settle (`requestVideoFrameCallback` if fired during paused seek,
+ *    or `requestAnimationFrame` raced with a short background-tab-safe timer so hidden tabs never stall).
+ * Rejects instead of silently baking a black frame if `readyState < 2` at timeout.
  */
-export function seekAndSettleVideo(
+export async function seekAndSettleVideo(
   video: HTMLVideoElement,
   targetTime: number,
   signal?: AbortSignal
 ): Promise<void> {
   if (signal?.aborted) {
-    return Promise.reject(new Error('ยกเลิกการบันทึกแล้ว'));
+    throw new Error('ยกเลิกการบันทึกแล้ว');
   }
 
   video.muted = true;
   if (!video.paused) video.pause();
+
+  if (video.readyState < 1) {
+    await waitForVideoMetadata(video, signal);
+  }
 
   const maxSeekable =
     Number.isFinite(video.duration) && video.duration > 0 ? Math.max(0, video.duration - 1e-4) : targetTime;
@@ -122,7 +176,7 @@ export function seekAndSettleVideo(
 
   const alreadyAtTarget = !video.seeking && Math.abs(video.currentTime - clamped) < 0.001;
   if (alreadyAtTarget && video.readyState >= 2) {
-    return Promise.resolve();
+    return;
   }
 
   return new Promise((resolve, reject) => {
@@ -132,6 +186,7 @@ export function seekAndSettleVideo(
     let vfcFired = false;
     let vfcHandle: number | null = null;
     let rafHandle: number | null = null;
+    let settleTimer: ReturnType<typeof setTimeout> | null = null;
 
     const cleanup = () => {
       video.removeEventListener('seeked', onSeeked);
@@ -139,6 +194,10 @@ export function seekAndSettleVideo(
       video.removeEventListener('canplay', onDataReady);
       signal?.removeEventListener('abort', onAbort);
       clearTimeout(safetyTimer);
+      if (settleTimer !== null) {
+        clearTimeout(settleTimer);
+        settleTimer = null;
+      }
       if (vfcHandle !== null && typeof v.cancelVideoFrameCallback === 'function') {
         try {
           v.cancelVideoFrameCallback(vfcHandle);
@@ -160,11 +219,15 @@ export function seekAndSettleVideo(
       resolve();
     };
 
-    const onAbort = () => {
+    const fail = (err: Error) => {
       if (settled) return;
       settled = true;
       cleanup();
-      reject(new Error('ยกเลิกการบันทึกแล้ว'));
+      reject(err);
+    };
+
+    const onAbort = () => {
+      fail(new Error('ยกเลิกการบันทึกแล้ว'));
     };
 
     const waitForFrameSettle = () => {
@@ -173,13 +236,25 @@ export function seekAndSettleVideo(
         finishOk();
         return;
       }
-      if (typeof requestAnimationFrame === 'function') {
+      // Prevent duplicate rAF / settle timer handles if both seeked and loadeddata fire
+      if (rafHandle !== null || settleTimer !== null) return;
+
+      const isHiddenTab = typeof document !== 'undefined' && document.hidden;
+      if (!isHiddenTab && typeof requestAnimationFrame === 'function') {
         rafHandle = requestAnimationFrame(() => {
           rafHandle = null;
           finishOk();
         });
+        // Short fallback timer prevents 2.5s stall if user switches to another tab mid-frame
+        settleTimer = setTimeout(() => {
+          settleTimer = null;
+          finishOk();
+        }, 50);
       } else {
-        finishOk();
+        settleTimer = setTimeout(() => {
+          settleTimer = null;
+          finishOk();
+        }, 16);
       }
     };
 
@@ -211,7 +286,14 @@ export function seekAndSettleVideo(
       }
     }
 
-    const safetyTimer = setTimeout(finishOk, 2500);
+    const safetyTimer = setTimeout(() => {
+      if (video.readyState >= 2) {
+        finishOk();
+      } else {
+        fail(new Error(`หมดเวลารอถอดรหัสเฟรมวิดีโอที่เวลา ${clamped.toFixed(2)}s (readyState=${video.readyState})`));
+      }
+    }, 2500);
+
     signal?.addEventListener('abort', onAbort, { once: true });
     video.addEventListener('seeked', onSeeked);
     video.addEventListener('loadeddata', onDataReady);
@@ -228,6 +310,7 @@ export function seekAndSettleVideo(
 interface SupportedVideoEncoderConfig {
   codec: string;
   hardwareAcceleration: HardwareAcceleration;
+  latencyMode: LatencyMode;
 }
 
 async function pickSupportedVideoConfig(
@@ -249,24 +332,30 @@ async function pickSupportedVideoConfig(
     'avc1.42001f', // H.264 Baseline L3.1
     'avc1.42E01E',
   ];
+  // Prefer `latencyMode: 'realtime'` so H.264 encoders disable B-frame reordering and emit
+  // strictly monotonic DTS===PTS timestamps compatible with mp4-muxer.
+  const latencyModes: LatencyMode[] = ['realtime', 'quality'];
   const accelModes: HardwareAcceleration[] = ['prefer-hardware', 'no-preference', 'prefer-software'];
 
-  for (const hardwareAcceleration of accelModes) {
-    for (const codec of codecs) {
-      try {
-        const res = await VideoEncoder.isConfigSupported({
-          codec,
-          width,
-          height,
-          bitrate,
-          framerate: fps,
-          hardwareAcceleration,
-        });
-        if (res.supported) {
-          return { codec, hardwareAcceleration };
+  for (const latencyMode of latencyModes) {
+    for (const hardwareAcceleration of accelModes) {
+      for (const codec of codecs) {
+        try {
+          const res = await VideoEncoder.isConfigSupported({
+            codec,
+            width,
+            height,
+            bitrate,
+            framerate: fps,
+            hardwareAcceleration,
+            latencyMode,
+          });
+          if (res.supported) {
+            return { codec, hardwareAcceleration, latencyMode };
+          }
+        } catch {
+          // try next candidate
         }
-      } catch {
-        // try next candidate
       }
     }
   }
@@ -363,9 +452,13 @@ export async function exportProjectToMp4(params: {
     decodeFrame,
   } = params;
 
-  if (signal.aborted) {
-    throw new Error('ยกเลิกการบันทึกแล้ว');
-  }
+  const checkAborted = () => {
+    if (signal.aborted) {
+      throw new Error('ยกเลิกการบันทึกแล้ว');
+    }
+  };
+
+  checkAborted();
 
   const [W, H] = getCanvasDimensions(aspectRatio, settings.resolution, false);
   const fps = settings.fps;
@@ -388,6 +481,8 @@ export async function exportProjectToMp4(params: {
     }
   }
 
+  checkAborted();
+
   const videoConfig = await pickSupportedVideoConfig(W, H, bitrate, fps);
   if (!videoConfig) {
     throw new Error(
@@ -402,9 +497,11 @@ export async function exportProjectToMp4(params: {
     totalFrames,
   });
 
-  if (signal.aborted) throw new Error('ยกเลิกการบันทึกแล้ว');
+  checkAborted();
 
   const mixedAudio = await renderMixedAudioBuffer(totalDuration, clips, assets);
+  checkAborted();
+
   let hasAudioEncoder = false;
   if (mixedAudio && 'AudioEncoder' in window && 'AudioData' in window) {
     try {
@@ -419,85 +516,120 @@ export async function exportProjectToMp4(params: {
       hasAudioEncoder = false;
     }
   }
+  checkAborted();
+
   const expectedAudioChunks = hasAudioEncoder && mixedAudio ? Math.ceil(mixedAudio.length / 1024) + 32 : 0;
 
-  // 3-tier Streaming Target: 1) User FileSystemFileHandle -> 2) OPFS disk stream -> 3) ArrayBuffer fallback
+  // Unified lifecycle variables guarded by try/catch/finally so zero streams, OPFS files,
+  // encoders, or dedicated export <video> elements can ever leak on error or abort.
   let writableStream: FileSystemWritableFileStream | null = null;
+  let streamClosed = false;
   let opfsTempHandle: FileSystemFileHandle | null = null;
   let opfsTempPath: string | null = null;
   let memoryTarget: ArrayBufferTarget | null = null;
-  let muxerTarget: ArrayBufferTarget | FileSystemWritableFileStreamTarget;
   let savedDirectly = false;
+  let videoEncoder: VideoEncoder | null = null;
+  const exportVideoEls = new Map<string, HTMLVideoElement>();
 
-  if (saveHandle) {
-    try {
-      writableStream = await saveHandle.createWritable();
-      muxerTarget = new FileSystemWritableFileStreamTarget(writableStream);
-      savedDirectly = true;
-    } catch {
-      writableStream = null;
+  const getExportVideoEl = (asset: MediaAsset): HTMLVideoElement | undefined => {
+    const existing = exportVideoEls.get(asset.id);
+    if (existing) return existing;
+    if (typeof document !== 'undefined' && asset.url) {
+      // Dedicated paused full-resolution element bound to original `asset.url` (immune to Proxy Mode & preview listeners)
+      const el = document.createElement('video');
+      el.src = asset.url;
+      el.muted = true;
+      el.playsInline = true;
+      el.preload = 'auto';
+      exportVideoEls.set(asset.id, el);
+      return el;
     }
-  }
-
-  if (!writableStream && opfsAvailable()) {
-    try {
-      opfsTempPath = `exports/export_${Date.now()}.mp4`;
-      opfsTempHandle = await getOpfsFileHandle(opfsTempPath, true);
-      writableStream = await opfsTempHandle.createWritable();
-      muxerTarget = new FileSystemWritableFileStreamTarget(writableStream);
-    } catch {
-      writableStream = null;
-      opfsTempHandle = null;
-      opfsTempPath = null;
-    }
-  }
-
-  if (!writableStream) {
-    memoryTarget = new ArrayBufferTarget();
-    muxerTarget = memoryTarget;
-  }
-
-  const muxer = new Muxer({
-    target: muxerTarget!,
-    video: {
-      codec: 'avc',
-      width: W,
-      height: H,
-    },
-    audio: hasAudioEncoder
-      ? {
-          codec: 'aac',
-          numberOfChannels: 2,
-          sampleRate: 48000,
-        }
-      : undefined,
-    fastStart: writableStream
-      ? {
-          expectedVideoChunks: totalFrames + 32,
-          expectedAudioChunks: hasAudioEncoder ? expectedAudioChunks : undefined,
-        }
-      : 'in-memory',
-  });
-
-  let videoEncoderError: Error | null = null;
-  const videoEncoder = new VideoEncoder({
-    output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
-    error: (err) => {
-      videoEncoderError = err instanceof Error ? err : new Error(String(err));
-    },
-  });
-
-  videoEncoder.configure({
-    codec: videoConfig.codec,
-    width: W,
-    height: H,
-    bitrate,
-    framerate: fps,
-    hardwareAcceleration: videoConfig.hardwareAcceleration,
-  });
+    return asset.videoEl;
+  };
 
   try {
-    // 1. Offline Audio Encoding (aligned to microsecond epoch 0 µs)
+    let muxerTarget: ArrayBufferTarget | FileSystemWritableFileStreamTarget;
+
+    // 3-tier Streaming Target: 1) User FileSystemFileHandle -> 2) OPFS disk stream -> 3) ArrayBuffer fallback
+    if (saveHandle) {
+      try {
+        writableStream = await saveHandle.createWritable();
+        muxerTarget = new FileSystemWritableFileStreamTarget(writableStream);
+        savedDirectly = true;
+      } catch {
+        writableStream = null;
+      }
+    }
+
+    if (!writableStream && opfsAvailable()) {
+      try {
+        opfsTempPath = `exports/export_${Date.now()}.mp4`;
+        opfsTempHandle = await getOpfsFileHandle(opfsTempPath, true);
+        writableStream = await opfsTempHandle.createWritable();
+        muxerTarget = new FileSystemWritableFileStreamTarget(writableStream);
+      } catch {
+        writableStream = null;
+        opfsTempHandle = null;
+        if (opfsTempPath) {
+          await opfsRemove(opfsTempPath).catch(() => {});
+          opfsTempPath = null;
+        }
+      }
+    }
+
+    if (!writableStream) {
+      memoryTarget = new ArrayBufferTarget();
+      muxerTarget = memoryTarget;
+    }
+
+    const muxer = new Muxer({
+      target: muxerTarget!,
+      video: {
+        codec: 'avc',
+        width: W,
+        height: H,
+      },
+      audio: hasAudioEncoder
+        ? {
+            codec: 'aac',
+            numberOfChannels: 2,
+            sampleRate: 48000,
+          }
+        : undefined,
+      firstTimestampBehavior: 'offset',
+      fastStart: writableStream
+        ? {
+            expectedVideoChunks: totalFrames + 32,
+            expectedAudioChunks: hasAudioEncoder ? expectedAudioChunks : undefined,
+          }
+        : 'in-memory',
+    });
+
+    let videoEncoderError: Error | null = null;
+    videoEncoder = new VideoEncoder({
+      output: (chunk, meta) => {
+        try {
+          muxer.addVideoChunk(chunk, meta);
+        } catch (err) {
+          videoEncoderError = err instanceof Error ? err : new Error(String(err));
+        }
+      },
+      error: (err) => {
+        videoEncoderError = err instanceof Error ? err : new Error(String(err));
+      },
+    });
+
+    videoEncoder.configure({
+      codec: videoConfig.codec,
+      width: W,
+      height: H,
+      bitrate,
+      framerate: fps,
+      hardwareAcceleration: videoConfig.hardwareAcceleration,
+      latencyMode: videoConfig.latencyMode,
+    });
+
+    // 1. Offline Audio Encoding (aligned to microsecond epoch 0 µs; safely normalizes negative AAC priming timestamps)
     if (hasAudioEncoder && mixedAudio) {
       onProgress({
         percent: 5,
@@ -507,8 +639,23 @@ export async function exportProjectToMp4(params: {
       });
 
       let audioEncoderError: Error | null = null;
+      let firstAudioTs: number | null = null;
+      let lastAudioTs = -1;
+
       const audioEncoder = new AudioEncoder({
-        output: (chunk, meta) => muxer.addAudioChunk(chunk, meta),
+        output: (chunk, meta) => {
+          try {
+            if (firstAudioTs === null) {
+              firstAudioTs = chunk.timestamp < 0 ? chunk.timestamp : 0;
+            }
+            const shifted = Math.max(0, chunk.timestamp - firstAudioTs);
+            const ts = shifted <= lastAudioTs ? lastAudioTs + 1 : shifted;
+            lastAudioTs = ts;
+            muxer.addAudioChunk(chunk, meta, ts);
+          } catch (err) {
+            audioEncoderError = err instanceof Error ? err : new Error(String(err));
+          }
+        },
         error: (err) => {
           audioEncoderError = err instanceof Error ? err : new Error(String(err));
         },
@@ -526,11 +673,11 @@ export async function exportProjectToMp4(params: {
         const ch1 = mixedAudio.numberOfChannels > 1 ? mixedAudio.getChannelData(1) : ch0;
         const chunkFrames = 1024;
         for (let offset = 0; offset < mixedAudio.length; offset += chunkFrames) {
-          if (signal.aborted) throw new Error('ยกเลิกการบันทึกแล้ว');
+          checkAborted();
           if (audioEncoderError) throw audioEncoderError;
 
           while (audioEncoder.encodeQueueSize > 32) {
-            if (signal.aborted) throw new Error('ยกเลิกการบันทึกแล้ว');
+            checkAborted();
             if (audioEncoderError) throw audioEncoderError;
             await new Promise((r) => setTimeout(r, 4));
           }
@@ -564,17 +711,8 @@ export async function exportProjectToMp4(params: {
     // 2. Dedicated OffscreenCanvas + Deterministic Offline Frame-by-Frame Video Compositing
     const { canvas: exportCanvas, ctx } = createExportCanvas(W, H);
 
-    assets.forEach((a) => {
-      if (a.videoEl) {
-        a.videoEl.muted = true;
-        if (!a.videoEl.paused) a.videoEl.pause();
-      }
-    });
-
     for (let f = 0; f < totalFrames; f++) {
-      if (signal.aborted) {
-        throw new Error('ยกเลิกการบันทึกแล้ว');
-      }
+      checkAborted();
       if (videoEncoderError) throw videoEncoderError;
 
       const timing = computeFrameTiming(f, fps);
@@ -589,8 +727,11 @@ export async function exportProjectToMp4(params: {
           if (decodeFrame) {
             decodedOverride = await decodeFrame(asset, srcT);
           }
-          if (!decodedOverride && asset.videoEl) {
-            await seekAndSettleVideo(asset.videoEl, srcT, signal);
+          if (!decodedOverride) {
+            const exportVid = getExportVideoEl(asset);
+            if (exportVid) {
+              await seekAndSettleVideo(exportVid, srcT, signal);
+            }
           }
         }
       }
@@ -602,6 +743,7 @@ export async function exportProjectToMp4(params: {
 
         renderCompositionFrame(ctx, W, H, t, clips, assets, colors, false, {
           frameProvider,
+          videoSource: (clip) => (clip.mediaId ? exportVideoEls.get(clip.mediaId) : undefined),
         });
       } finally {
         if (decodedOverride && 'close' in decodedOverride && typeof decodedOverride.close === 'function') {
@@ -610,7 +752,7 @@ export async function exportProjectToMp4(params: {
       }
 
       while (videoEncoder.encodeQueueSize > 12) {
-        if (signal.aborted) throw new Error('ยกเลิกการบันทึกแล้ว');
+        checkAborted();
         if (videoEncoderError) throw videoEncoderError;
         await new Promise((r) => setTimeout(r, 4));
       }
@@ -646,24 +788,32 @@ export async function exportProjectToMp4(params: {
 
     await videoEncoder.flush();
     if (videoEncoderError) throw videoEncoderError;
-  } catch (err) {
+    checkAborted();
+
+    muxer.finalize();
+
     if (writableStream) {
+      await writableStream.close();
+      streamClosed = true;
+    }
+  } catch (err) {
+    if (writableStream && !streamClosed) {
       await writableStream.abort().catch(() => {});
     }
     if (opfsTempPath) {
-      await opfsRemove(opfsTempPath);
+      await opfsRemove(opfsTempPath).catch(() => {});
     }
     throw err;
   } finally {
-    if (videoEncoder.state !== 'closed') {
+    if (videoEncoder && videoEncoder.state !== 'closed') {
       videoEncoder.close();
     }
-  }
-
-  muxer.finalize();
-
-  if (writableStream) {
-    await writableStream.close();
+    exportVideoEls.forEach((el) => {
+      el.pause();
+      el.removeAttribute('src');
+      el.load();
+    });
+    exportVideoEls.clear();
   }
 
   onProgress({

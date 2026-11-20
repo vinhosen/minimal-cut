@@ -127,16 +127,25 @@ export class RenderClient {
 
     // Use WebCodecs cached frame when scrubbing OR playing a reversed clip (no video.currentTime spam!)
     let cachedBitmap: ImageBitmap | null = null;
+    let waitingForReverseWcFrame = false;
     if (activeVideo?.mediaId && (!isPlaying || activeVideo.reverse)) {
       const wc = this.wcSources.get(activeVideo.mediaId);
       if (wc && !wc.isFailed()) {
         const srcT = clipSourceTime(activeVideo, time);
         cachedBitmap = wc.getCachedOrRequestFrame(srcT);
+        if (isPlaying && activeVideo.reverse && !cachedBitmap) {
+          waitingForReverseWcFrame = true;
+        }
       }
     }
 
     // Phase 1 Strict Guardrail: NEVER clear or touch the visible canvas unless the active video
     // frame is ready (`readyState >= 2 && !seeking`) or we have a decoded WebCodecs frame.
+    // During reverse playback with an active WebCodecs decoder, hold the previous valid frame on
+    // cache miss instead of flashing back to the parked HTMLVideoElement entry frame.
+    if (waitingForReverseWcFrame) {
+      return false;
+    }
     const videoEl = activeVideo && !cachedBitmap ? videoSource(activeVideo) ?? videoAsset?.videoEl : undefined;
     if (activeVideo && videoAsset && !cachedBitmap && !isVideoFrameReady(videoEl)) {
       return false;

@@ -297,4 +297,46 @@ describe('Phase 2 — Authoritative AudioContext Master Clock, Lookahead Schedul
     expect(activeElAtCut?.muted).toBe(true);
     expect(activeElAtCut?.currentTime).toBeCloseTo(10.0);
   });
+
+  it('does not permanently latch preRolledClipId while standby is seeking, and retries once ready', () => {
+    const standbyVideo = makeMockVideoEl(0);
+    globalThis.document = {
+      createElement: vi.fn(() => standbyVideo.el),
+    } as unknown as Document;
+
+    const mainVideo = makeMockVideoEl(0);
+    const assets = new Map<string, MediaAsset>([
+      [
+        'm1',
+        {
+          id: 'm1',
+          name: 'clip.mp4',
+          type: 'video',
+          file: new File([], 'clip.mp4'),
+          url: 'blob:test',
+          duration: 20,
+          width: 1920,
+          height: 1080,
+          videoEl: mainVideo.el,
+        },
+      ],
+    ]);
+
+    const c1 = makeClip({ id: 'c1', timelineStart: 0, duration: 5, sourceStart: 0 });
+    const c2 = makeClip({ id: 'c2', timelineStart: 5, duration: 5, sourceStart: 12 });
+    const clips = [c1, c2];
+    const ctrl = new VideoSyncController(() => assets, vi.fn());
+
+    // Enter lookahead window (t = 4.0 -> 1.0s before c2) while standby is still seeking
+    (standbyVideo.el as unknown as { seeking: boolean }).seeking = true;
+    ctrl.seekDiscrete(4.0, clips, true, { driftThresholdSec: 0.08, alwaysMuteVideo: true });
+    expect(standbyVideo.setCurrentTimeSpy).not.toHaveBeenCalled();
+
+    // Standby finishes seeking -> next playback tick MUST retry and pre-roll c2 to sourceStart = 12
+    (standbyVideo.el as unknown as { seeking: boolean }).seeking = false;
+    mainVideo.advanceRaw(4.1);
+    ctrl.updatePlayback(4.1, clips, { driftThresholdSec: 0.08, alwaysMuteVideo: true });
+    expect(standbyVideo.setCurrentTimeSpy).toHaveBeenCalledTimes(1);
+    expect(standbyVideo.setCurrentTimeSpy).toHaveBeenLastCalledWith(12);
+  });
 });

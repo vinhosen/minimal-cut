@@ -211,11 +211,13 @@ export class VideoSyncController {
       return;
     }
     if (this.preRolledClipId === upcoming.id) return;
-    this.preRolledClipId = upcoming.id;
     upcomingEl.muted = true;
     if (!upcomingEl.paused) upcomingEl.pause();
+    // Do not permanently latch preRolledClipId while standby is still mid-seek; retry next tick.
+    if (upcomingEl.seeking) return;
+    this.preRolledClipId = upcoming.id;
     const tgt = clipSourceTime(upcoming, upcoming.timelineStart);
-    if (!upcomingEl.seeking && Math.abs(upcomingEl.currentTime - tgt) > 0.02) {
+    if (Math.abs(upcomingEl.currentTime - tgt) > 0.02) {
       upcomingEl.currentTime = tgt;
     }
   }
@@ -234,6 +236,7 @@ export class VideoSyncController {
     const { active, activeEl, upcoming, upcomingEl } = this.assignClips(time, clips);
     this.lastActiveClipId = active?.id ?? null;
     this.preRolledClipId = null;
+    this.lastCorrectiveSeekTimeline = time;
 
     if (active && activeEl) {
       const asset = assets.get(active.mediaId!);
@@ -350,5 +353,6 @@ export class VideoSyncController {
     this.assignment.clear();
     this.lastActiveClipId = null;
     this.preRolledClipId = null;
+    this.lastCorrectiveSeekTimeline = -Infinity;
   }
 }

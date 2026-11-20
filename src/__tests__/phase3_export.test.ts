@@ -294,4 +294,27 @@ describe('Phase 3 — Deterministic Frame-Accurate Offline WebCodecs Export', ()
     expect(encoderClosed).toBe(true);
     expect(progressValues[progressValues.length - 1]).toBe(100);
   });
+
+  it('rejects on seekAndSettleVideo timeout when readyState < 2 instead of baking a black frame', async () => {
+    vi.useFakeTimers();
+    try {
+      const video = {
+        muted: false,
+        paused: true,
+        seeking: false,
+        readyState: 1,
+        duration: 10,
+        currentTime: 0,
+        pause: vi.fn(),
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+      };
+      const pending = seekAndSettleVideo(video as unknown as HTMLVideoElement, 4.0);
+      const assertion = expect(pending).rejects.toThrow(/หมดเวลารอถอดรหัสเฟรมวิดีโอ/);
+      await vi.advanceTimersByTimeAsync(2600);
+      await assertion;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
