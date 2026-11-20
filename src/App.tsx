@@ -11,8 +11,20 @@ import { computeAudioPeaks, getCanvasDimensions, nextId } from './utils/timecode
 import { renderCompositionFrame } from './utils/renderer';
 import { exportProjectToMp4, type ExportProgress } from './utils/exporter';
 import { exportViaRustEngine, isRustBackendAvailable, uploadMediaToRust } from './utils/rustBridge';
-import { audibleClips, ensureAssetAudio, scheduleClipAudio } from './audio/scheduleClipAudio';
+import { audibleClips, scheduleClipAudio } from './audio/scheduleClipAudio';
 import { VideoSyncController } from './engine/VideoSyncController';
+import { detectCapabilities } from './utils/capabilities';
+import {
+  clearAllRecoveryData,
+  loadRecoverySnapshot,
+  persistMediaFile,
+  restoreMediaFile,
+  type ProjectSnapshot,
+  type RecoveryMeta,
+} from './storage/projectDb';
+import { useAutosave } from './hooks/useAutosave';
+import { createAssetFromFile } from './media/createAsset';
+import { RecoveryDialog } from './components/RecoveryDialog';
 import { Film, FolderPlus, SlidersHorizontal } from 'lucide-react';
 import { TopBar } from './components/TopBar';
 import { MediaSidebar } from './components/MediaSidebar';
@@ -106,15 +118,49 @@ export function App() {
   const micChunksRef = useRef<Blob[]>([]);
   const micStreamRef = useRef<MediaStream | null>(null);
 
-  const webCodecsSupported = typeof window !== 'undefined' && 'VideoEncoder' in window;
+  const capabilities = useMemo(() => detectCapabilities(), []);
+  const webCodecsSupported = capabilities.webCodecsEncode;
   const serverIdMapRef = useRef<Map<string, string>>(new Map());
   const rustAvailableRef = useRef(false);
+
+  const [recoveryCandidate, setRecoveryCandidate] = useState<{
+    meta: RecoveryMeta;
+    snapshot: ProjectSnapshot;
+  } | null>(null);
+  const [isRestoringRecovery, setIsRestoringRecovery] = useState(false);
 
   useEffect(() => {
     isRustBackendAvailable().then((ok) => {
       rustAvailableRef.current = ok;
     });
   }, []);
+
+  // FilmCraft OPFS / IndexedDB Crash-Recovery check on startup
+  useEffect(() => {
+    if (capabilities.flags.fresh) {
+      void clearAllRecoveryData();
+      return;
+    }
+    if (capabilities.flags.noRecover) {
+      return;
+    }
+    loadRecoverySnapshot()
+      .then((found) => {
+        if (found && clipsRef.current.length === 0) {
+          setRecoveryCandidate(found);
+        }
+      })
+      .catch(() => {});
+  }, [capabilities.flags.fresh, capabilities.flags.noRecover]);
+
+  const { autosaveLabel } = useAutosave({
+    clips,
+    assets,
+    colors,
+    aspectRatio,
+    exportSettings,
+    enabled: !recoveryCandidate,
+  });
 
   const canvasDims = useMemo(
     () => getCanvasDimensions(aspectRatio, exportSettings.resolution, proxyMode),
@@ -517,121 +563,86 @@ export function App() {
   );
 
   const handleImportFiles = useCallback(
-    async (fileList: FileList) => {
+    async (fileList: FileList | File[]) => {
       for (const file of Array.from(fileList)) {
-        const url = URL.createObjectURL(file);
-        if (file.type.startsWith('video/')) {
-          const vid = document.createElement('video');
-          vid.src = url;
-          vid.playsInline = true;
-          vid.preload = 'auto';
-          vid.onloadedmetadata = () => {
-            const asset: MediaAsset = {
-              id: nextId('vid'),
-              type: 'video',
-              name: file.name,
-              url,
-              file,
-              duration: vid.duration || 5,
-              width: vid.videoWidth || 1280,
-              height: vid.videoHeight || 720,
-              videoEl: vid,
-            };
-            assetsMapRef.current.set(asset.id, asset);
-            setAssets((prev) => [...prev, asset]);
-            addAssetToTimeline(asset);
-            showToast(`นำเข้า "${file.name}" แล้ว`);
-            if (rustAvailableRef.current) {
-              uploadMediaToRust(file).then((sid) => {
-                if (sid) serverIdMapRef.current.set(asset.id, sid);
-              });
-            }
-            // Decode video audio track in background so preview and export use sample-accurate WebAudio
-            const ctx = ensureAudioCtx();
-            ensureAssetAudio(asset, ctx).then((buf) => {
-              if (!buf) return;
-              asset.peaks = computeAudioPeaks(buf);
-              setAssets((prev) => prev.map((a) => (a.id === asset.id ? { ...asset } : a)));
+        try {
+          const asset = await createAssetFromFile(file, {
+            getAudioCtx: ensureAudioCtx,
+            onAudioReady: (readyAsset) => {
+              setAssets((prev) => prev.map((a) => (a.id === readyAsset.id ? { ...readyAsset } : a)));
               if (isPlayingRef.current) {
-                syncVideoElements(playheadRef.current, false);
+                if (readyAsset.type === 'video') syncVideoElements(playheadRef.current, false);
                 startAudioAt(playheadRef.current);
               }
-            });
-          };
-          vid.onerror = () => {
-            URL.revokeObjectURL(url);
-            showToast(`ไม่สามารถเปิดไฟล์ "${file.name}" ได้`);
-          };
-        } else if (file.type.startsWith('image/')) {
-          const img = new Image();
-          img.onload = () => {
-            const asset: MediaAsset = {
-              id: nextId('img'),
-              type: 'image',
-              name: file.name,
-              url,
-              file,
-              duration: 5,
-              width: img.width,
-              height: img.height,
-              imgEl: img,
-            };
-            assetsMapRef.current.set(asset.id, asset);
-            setAssets((prev) => [...prev, asset]);
-            addAssetToTimeline(asset);
-            showToast(`นำเข้า "${file.name}" แล้ว`);
-            if (rustAvailableRef.current) {
-              uploadMediaToRust(file).then((sid) => {
-                if (sid) serverIdMapRef.current.set(asset.id, sid);
-              });
-            }
-          };
-          img.onerror = () => {
-            URL.revokeObjectURL(url);
-            showToast(`ไม่สามารถเปิดรูป "${file.name}" ได้`);
-          };
-          img.src = url;
-        } else if (file.type.startsWith('audio/')) {
-          // Instant add via <audio> metadata, then decode waveform asynchronously
-          const aud = document.createElement('audio');
-          aud.src = url;
-          aud.preload = 'metadata';
-          aud.onloadedmetadata = () => {
-            const asset: MediaAsset = {
-              id: nextId('aud'),
-              type: 'audio',
-              name: file.name,
-              url,
-              file,
-              duration: aud.duration || 5,
-              width: 0,
-              height: 0,
-            };
-            assetsMapRef.current.set(asset.id, asset);
-            setAssets((prev) => [...prev, asset]);
-            addAssetToTimeline(asset);
-            showToast(`นำเข้าเสียง "${file.name}" แล้ว`);
+            },
+          });
+          assetsMapRef.current.set(asset.id, asset);
+          setAssets((prev) => [...prev, asset]);
+          addAssetToTimeline(asset);
+          showToast(`นำเข้า "${file.name}" แล้ว`);
 
-            if (rustAvailableRef.current) {
-              uploadMediaToRust(file).then((sid) => {
-                if (sid) serverIdMapRef.current.set(asset.id, sid);
-              });
-            }
+          // Persist media file in background to FilmCraft OPFS / IndexedDB for crash recovery
+          void persistMediaFile(asset.id, file);
 
-            // Decode AudioBuffer in background without blocking UI
-            const ctx = ensureAudioCtx();
-            ensureAssetAudio(asset, ctx).then((buf) => {
-              if (!buf) return;
-              asset.peaks = computeAudioPeaks(buf);
-              setAssets((prev) => prev.map((a) => (a.id === asset.id ? { ...asset } : a)));
-              if (isPlayingRef.current) startAudioAt(playheadRef.current);
+          if (rustAvailableRef.current) {
+            uploadMediaToRust(file).then((sid) => {
+              if (sid) serverIdMapRef.current.set(asset.id, sid);
             });
-          };
+          }
+        } catch (err) {
+          showToast(err instanceof Error ? err.message : `ไม่สามารถเปิดไฟล์ "${file.name}" ได้`);
         }
       }
     },
     [addAssetToTimeline, ensureAudioCtx, showToast, startAudioAt, syncVideoElements]
   );
+
+  const handleRestoreRecovery = useCallback(async () => {
+    if (!recoveryCandidate) return;
+    setIsRestoringRecovery(true);
+    try {
+      const { snapshot } = recoveryCandidate;
+      const restoredAssets: MediaAsset[] = [];
+
+      for (const item of snapshot.assetsManifest) {
+        const file = await restoreMediaFile(item);
+        if (!file) continue;
+        try {
+          const asset = await createAssetFromFile(file, {
+            id: item.id,
+            getAudioCtx: ensureAudioCtx,
+            onAudioReady: (readyAsset) => {
+              setAssets((prev) => prev.map((a) => (a.id === readyAsset.id ? { ...readyAsset } : a)));
+            },
+          });
+          assetsMapRef.current.set(asset.id, asset);
+          restoredAssets.push(asset);
+        } catch {
+          // skip unreadable media
+        }
+      }
+
+      if (snapshot.aspectRatio) setAspectRatio(snapshot.aspectRatio);
+      if (snapshot.colors) setColors({ ...DEFAULT_COLORS, ...snapshot.colors });
+      if (snapshot.exportSettings) setExportSettings(snapshot.exportSettings);
+      setAssets(restoredAssets);
+      clipsRef.current = snapshot.clips;
+      setClips(snapshot.clips);
+      setRecoveryCandidate(null);
+      showToast(`กู้คืนโปรเจกต์สำเร็จ (${snapshot.clips.length} คลิป)`);
+    } catch {
+      showToast('ไม่สามารถกู้คืนโปรเจกต์ได้');
+      setRecoveryCandidate(null);
+    } finally {
+      setIsRestoringRecovery(false);
+    }
+  }, [ensureAudioCtx, recoveryCandidate, showToast]);
+
+  const handleDiscardRecovery = useCallback(async () => {
+    setRecoveryCandidate(null);
+    await clearAllRecoveryData();
+    showToast('เริ่มโปรเจกต์ใหม่แล้ว');
+  }, [showToast]);
 
   const handleAddTextClip = useCallback(
     (text: string, style: TextStyleType, y?: number, dur = 4) => {
@@ -806,6 +817,7 @@ export function App() {
     setSelectedClipId(null);
     setHistory([]);
     setRedoStack([]);
+    void clearAllRecoveryData();
     seekTo(0);
     showToast('เริ่มโปรเจกต์ใหม่แล้ว');
   }, [seekTo, showToast, togglePlay]);
@@ -835,7 +847,7 @@ export function App() {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [handleDelete, handleRedo, handleSplit, handleUndo, togglePlay]);
 
-  // Export Handler (120 FPS WebCodecs Offline Engine)
+  // Export Handler (120 FPS WebCodecs Streaming Engine)
   const handleStartExport = async () => {
     if (totalDuration <= 0) return;
     if (isPlayingRef.current) togglePlay(false);
@@ -887,12 +899,17 @@ export function App() {
           onProgress: setExportProgress,
         });
 
-        const url = URL.createObjectURL(res.blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = res.filename;
-        a.click();
-        setTimeout(() => URL.revokeObjectURL(url), 4000);
+        if (!res.savedDirectly) {
+          const url = URL.createObjectURL(res.blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = res.filename;
+          a.click();
+          setTimeout(() => {
+            URL.revokeObjectURL(url);
+            void res.cleanup?.();
+          }, 5000);
+        }
 
         setExportDone({
           filename: res.filename,
@@ -1618,6 +1635,8 @@ export function App() {
         canRedo={redoStack.length > 0}
         hasClips={clips.length > 0}
         webCodecsSupported={webCodecsSupported}
+        capabilities={capabilities}
+        autosaveLabel={clips.length > 0 ? autosaveLabel : undefined}
         onUndo={handleUndo}
         onRedo={handleRedo}
         onClearProject={handleClearProject}
@@ -1627,6 +1646,15 @@ export function App() {
           setExportOpen(true);
         }}
       />
+
+      {recoveryCandidate && (
+        <RecoveryDialog
+          meta={recoveryCandidate.meta}
+          isRestoring={isRestoringRecovery}
+          onRestore={handleRestoreRecovery}
+          onDiscard={handleDiscardRecovery}
+        />
+      )}
 
       <main className="workspace-upper">
         <MediaSidebar

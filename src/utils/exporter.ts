@@ -1,9 +1,10 @@
-import { Muxer, ArrayBufferTarget } from 'mp4-muxer';
+import { Muxer, ArrayBufferTarget, FileSystemWritableFileStreamTarget } from 'mp4-muxer';
 import type { AspectRatio, ColorSettings, ExportSettings, MediaAsset, TimelineClip } from '../types/editor';
 import { getCanvasDimensions } from './timecode';
-import { renderCompositionFrame } from './renderer';
+import { renderCompositionFrame, type FrameProvider } from './renderer';
 import { clipSourceTime, findActiveClip } from './clipTime';
 import { audibleClips, ensureAssetAudio, scheduleClipAudio } from '../audio/scheduleClipAudio';
+import { getOpfsFileHandle, getStorageEstimate, opfsAvailable, opfsRemove } from '../storage/opfs';
 
 export interface ExportProgress {
   percent: number;
@@ -12,10 +13,48 @@ export interface ExportProgress {
   totalFrames: number;
 }
 
+export interface ExportResult {
+  blob: Blob;
+  filename: string;
+  engine: 'webcodecs' | 'mediarecorder';
+  /** True when the file was already written to a user-picked FileSystemFileHandle via showSaveFilePicker. */
+  savedDirectly?: boolean;
+  /** Optional cleanup callback (e.g. deletes temporary OPFS export file after download). */
+  cleanup?: () => Promise<void>;
+}
+
+/**
+ * Prompt the user with File System Access API (`showSaveFilePicker`) if supported and requested.
+ * Must be called synchronously inside the click gesture before awaiting other promises.
+ */
+export async function tryPickExportSaveHandle(suggestedName: string): Promise<FileSystemFileHandle | null> {
+  if (typeof window === 'undefined' || !('showSaveFilePicker' in window)) return null;
+  try {
+    const picker = (
+      window as unknown as {
+        showSaveFilePicker: (opts: unknown) => Promise<FileSystemFileHandle>;
+      }
+    ).showSaveFilePicker;
+    return await picker({
+      suggestedName,
+      types: [
+        {
+          description: 'MP4 Video',
+          accept: { 'video/mp4': ['.mp4'] },
+        },
+      ],
+    });
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'AbortError') {
+      throw new Error('ยกเลิกการเลือกไฟล์สำหรับบันทึก');
+    }
+    return null;
+  }
+}
+
 /**
  * Seeks an HTMLVideoElement to `targetTime` and waits until the frame is actually decoded
- * (`readyState >= 2 && !video.seeking`). Replaces the old 180ms timeout that caused black/stale
- * frames at cut points during export.
+ * (`readyState >= 2 && !video.seeking`).
  */
 function seekVideoTo(video: HTMLVideoElement, targetTime: number): Promise<void> {
   const clamped = Math.max(0, Math.min(targetTime, video.duration || targetTime));
@@ -27,7 +66,6 @@ function seekVideoTo(video: HTMLVideoElement, targetTime: number): Promise<void>
     const finish = () => {
       if (done) return;
       if (video.seeking || video.readyState < 2) {
-        // Wait a micro-poll if seeked fired before readyState reached HAVE_CURRENT_DATA
         setTimeout(() => {
           if (!done) {
             done = true;
@@ -98,7 +136,6 @@ export async function renderMixedAudioBuffer(
   const length = Math.ceil(totalDuration * sampleRate);
   const offline = new OfflineAudioContext(2, Math.max(1, length), sampleRate);
 
-  // Ensure all referenced audio and video assets have their AudioBuffer decoded before mixing
   for (const clip of candidateClips) {
     const asset = clip.mediaId ? assets.get(clip.mediaId) : undefined;
     if (asset && !asset.audioBuffer && asset.audioStatus !== 'none') {
@@ -137,19 +174,40 @@ export async function exportProjectToMp4(params: {
   totalDuration: number;
   signal: AbortSignal;
   onProgress: (p: ExportProgress) => void;
-}): Promise<{ blob: Blob; filename: string; engine: 'webcodecs' | 'mediarecorder' }> {
-  const { clips, assets, colors, aspectRatio, settings, totalDuration, signal, onProgress } = params;
+  saveHandle?: FileSystemFileHandle | null;
+  /** Optional Phase 3 frame-accurate decoder callback `(asset, srcTimeSec) => Promise<CanvasImageSource | null>` */
+  decodeFrame?: (asset: MediaAsset, srcTimeSec: number) => Promise<CanvasImageSource | null>;
+}): Promise<ExportResult> {
+  const {
+    clips,
+    assets,
+    colors,
+    aspectRatio,
+    settings,
+    totalDuration,
+    signal,
+    onProgress,
+    saveHandle,
+    decodeFrame,
+  } = params;
   const [W, H] = getCanvasDimensions(aspectRatio, settings.resolution, false);
   const fps = settings.fps;
   const bitrate = settings.bitrateMbps * 1_000_000;
   const totalFrames = Math.max(1, Math.ceil(totalDuration * fps));
+  const filename = `MinimalCut_${W}x${H}_${fps}fps.mp4`;
 
-  // Wait for custom web fonts (Inter, Noto Sans Thai) so text overlays on early frames don't use fallback font
+  // Estimate required storage quota before starting
+  const estimatedBytes = Math.ceil(((bitrate + 192_000) / 8) * totalDuration * 1.15);
+  const { usageBytes, quotaBytes } = await getStorageEstimate();
+  if (quotaBytes > 0 && quotaBytes - usageBytes < estimatedBytes && !saveHandle) {
+    throw new Error('พื้นที่จัดเก็บของเบราว์เซอร์ไม่เพียงพอสำหรับการเรนเดอร์ไฟล์ขนาดนี้');
+  }
+
   if (typeof document !== 'undefined' && 'fonts' in document) {
     try {
       await document.fonts.ready;
     } catch {
-      // ignore font readiness error
+      // ignore
     }
   }
 
@@ -158,17 +216,53 @@ export async function exportProjectToMp4(params: {
   if (codec && 'VideoFrame' in window) {
     onProgress({
       percent: 1,
-      message: `ใช้ WebCodecs Offline (${W}×${H} @ ${fps} FPS • ${codec})`,
+      message: `ใช้ WebCodecs Streaming (${W}×${H} @ ${fps} FPS • ${codec})`,
       currentFrame: 0,
       totalFrames,
     });
 
     const mixedAudio = await renderMixedAudioBuffer(totalDuration, clips, assets);
     const hasAudioEncoder = Boolean(mixedAudio && 'AudioEncoder' in window && 'AudioData' in window);
+    const expectedAudioChunks = hasAudioEncoder && mixedAudio ? Math.ceil(mixedAudio.length / 1024) + 32 : 0;
 
-    const target = new ArrayBufferTarget();
+    // 3-tier Streaming Target: 1) User FileSystemFileHandle -> 2) OPFS disk stream -> 3) ArrayBuffer fallback
+    let writableStream: FileSystemWritableFileStream | null = null;
+    let opfsTempHandle: FileSystemFileHandle | null = null;
+    let opfsTempPath: string | null = null;
+    let memoryTarget: ArrayBufferTarget | null = null;
+    let muxerTarget: ArrayBufferTarget | FileSystemWritableFileStreamTarget;
+    let savedDirectly = false;
+
+    if (saveHandle) {
+      try {
+        writableStream = await saveHandle.createWritable();
+        muxerTarget = new FileSystemWritableFileStreamTarget(writableStream);
+        savedDirectly = true;
+      } catch {
+        writableStream = null;
+      }
+    }
+
+    if (!writableStream && opfsAvailable()) {
+      try {
+        opfsTempPath = `exports/export_${Date.now()}.mp4`;
+        opfsTempHandle = await getOpfsFileHandle(opfsTempPath, true);
+        writableStream = await opfsTempHandle.createWritable();
+        muxerTarget = new FileSystemWritableFileStreamTarget(writableStream);
+      } catch {
+        writableStream = null;
+        opfsTempHandle = null;
+        opfsTempPath = null;
+      }
+    }
+
+    if (!writableStream) {
+      memoryTarget = new ArrayBufferTarget();
+      muxerTarget = memoryTarget;
+    }
+
     const muxer = new Muxer({
-      target,
+      target: muxerTarget!,
       video: {
         codec: 'avc',
         width: W,
@@ -181,7 +275,12 @@ export async function exportProjectToMp4(params: {
             sampleRate: 48000,
           }
         : undefined,
-      fastStart: 'in-memory',
+      fastStart: writableStream
+        ? {
+            expectedVideoChunks: totalFrames + 32,
+            expectedAudioChunks: hasAudioEncoder ? expectedAudioChunks : undefined,
+          }
+        : 'in-memory',
     });
 
     let encoderError: Error | null = null;
@@ -202,7 +301,6 @@ export async function exportProjectToMp4(params: {
     });
 
     try {
-      // Encode Audio if present
       if (hasAudioEncoder && mixedAudio) {
         const audioEncoder = new AudioEncoder({
           output: (chunk, meta) => muxer.addAudioChunk(chunk, meta),
@@ -235,8 +333,11 @@ export async function exportProjectToMp4(params: {
               timestamp: Math.round((offset / 48000) * 1_000_000),
               data: planar,
             });
-            audioEncoder.encode(audioData);
-            audioData.close();
+            try {
+              audioEncoder.encode(audioData);
+            } finally {
+              audioData.close();
+            }
           }
           await audioEncoder.flush();
         } finally {
@@ -250,7 +351,6 @@ export async function exportProjectToMp4(params: {
       const ctx = canvas.getContext('2d', { alpha: false })!;
       const frameDurationUs = Math.round(1_000_000 / fps);
 
-      // Pause any playing videos before offline seek
       assets.forEach((a) => {
         if (a.videoEl && !a.videoEl.paused) a.videoEl.pause();
       });
@@ -262,20 +362,34 @@ export async function exportProjectToMp4(params: {
         if (encoderError) throw encoderError;
 
         const t = f / fps;
-
-        // Sync active video clip accurately to frame timestamp using shared clipSourceTime
         const activeVideo = findActiveClip(clips, 'video', t);
+        let decodedOverride: CanvasImageSource | null = null;
+
         if (activeVideo && activeVideo.mediaId) {
           const asset = assets.get(activeVideo.mediaId);
-          if (asset?.videoEl) {
+          if (asset) {
             const srcT = clipSourceTime(activeVideo, t);
-            await seekVideoTo(asset.videoEl, srcT);
+            if (decodeFrame) {
+              decodedOverride = await decodeFrame(asset, srcT);
+            }
+            if (!decodedOverride && asset.videoEl) {
+              await seekVideoTo(asset.videoEl, srcT);
+            }
           }
         }
 
-        renderCompositionFrame(ctx, W, H, t, clips, assets, colors, false);
+        const frameProvider: FrameProvider | undefined = decodedOverride
+          ? (clip) => (clip.id === activeVideo?.id ? decodedOverride ?? undefined : undefined)
+          : undefined;
 
-        // Backpressure control so GPU encoder queue stays healthy at 120 FPS
+        renderCompositionFrame(ctx, W, H, t, clips, assets, colors, false, {
+          frameProvider,
+        });
+
+        if (decodedOverride && 'close' in decodedOverride && typeof decodedOverride.close === 'function') {
+          decodedOverride.close();
+        }
+
         while (videoEncoder.encodeQueueSize > 12) {
           if (signal.aborted) throw new Error('ยกเลิกการบันทึกแล้ว');
           if (encoderError) throw encoderError;
@@ -306,12 +420,20 @@ export async function exportProjectToMp4(params: {
 
       onProgress({
         percent: 99,
-        message: 'กำลังรวมไฟล์ MP4...',
+        message: 'กำลังปิดและบันทึกสตรีม MP4...',
         currentFrame: totalFrames,
         totalFrames,
       });
 
       await videoEncoder.flush();
+    } catch (err) {
+      if (writableStream) {
+        await writableStream.abort().catch(() => {});
+      }
+      if (opfsTempPath) {
+        await opfsRemove(opfsTempPath);
+      }
+      throw err;
     } finally {
       if (videoEncoder.state !== 'closed') {
         videoEncoder.close();
@@ -320,10 +442,35 @@ export async function exportProjectToMp4(params: {
 
     muxer.finalize();
 
-    const blob = new Blob([target.buffer], { type: 'video/mp4' });
+    if (writableStream) {
+      await writableStream.close();
+    }
+
+    if (savedDirectly && saveHandle) {
+      const file = await saveHandle.getFile();
+      return {
+        blob: file,
+        filename: saveHandle.name || filename,
+        engine: 'webcodecs',
+        savedDirectly: true,
+      };
+    }
+
+    if (opfsTempHandle && opfsTempPath) {
+      const file = await opfsTempHandle.getFile();
+      const tempRel = opfsTempPath;
+      return {
+        blob: file,
+        filename,
+        engine: 'webcodecs',
+        cleanup: () => opfsRemove(tempRel),
+      };
+    }
+
+    const blob = new Blob([memoryTarget!.buffer], { type: 'video/mp4' });
     return {
       blob,
-      filename: `MinimalCut_${W}x${H}_${fps}fps.mp4`,
+      filename,
       engine: 'webcodecs',
     };
   }
@@ -379,7 +526,6 @@ export async function exportProjectToMp4(params: {
         return;
       }
 
-      // Sync active video element during MediaRecorder realtime capture
       const activeVideo = findActiveClip(clips, 'video', elapsed);
       assets.forEach((asset) => {
         if (asset.type !== 'video' || !asset.videoEl) return;

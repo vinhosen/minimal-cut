@@ -25,11 +25,11 @@ verify with `npm run build && npm run lint && npm test`, commit, update this fil
 - [x] 0.3 Cut-point stutter (B8): hold last good frame, AudioContext master clock, soft video sync, standby video elements, video-audio via AudioBuffer (B1), 5ms declick
 - [x] 0.4 Exporter robustness: proper seek wait (B8e), encoder cleanup (B6), MediaRecorder fallback sync (B5), fonts ready (B7)
 
-### Phase 1 — Stability
-- [ ] 1.1 Remove singlefile, `base: './'`, COOP/COEP (dev/preview headers + coi-serviceworker), CI lint + PR build
-- [ ] 1.2 Capability detection + TopBar badge
-- [ ] 1.3 OPFS + IndexedDB autosave + RecoveryDialog (+ `createAsset` extraction)
-- [ ] 1.4 Streaming export (showSaveFilePicker → OPFS temp → ArrayBuffer fallback) + storage estimate
+### Phase 1 — Stability (with FilmCraft OPFS & Tick time base)
+- [x] 1.1 Remove singlefile, `base: './'`, COOP/COEP (dev/preview headers + coi-serviceworker), CI lint + PR build, FilmCraft `Tick` (`254_016_000_000n`) time base
+- [x] 1.2 Capability detection + TopBar badge + FilmCraft URL flags (`?norecover`, `?fresh`, `?cpu`, `?webgl`, `?nowebcodecs`)
+- [x] 1.3 FilmCraft coalesced OPFS + IndexedDB autosave + `RecoveryPolicy` + RecoveryDialog (+ `createAsset` extraction)
+- [x] 1.4 Streaming export (`showSaveFilePicker` → OPFS disk stream → `ArrayBuffer` fallback) + storage quota estimate
 
 ### Phase 2 — Smoothness
 - [ ] 2.1 Renderer refactor to frame sources + OffscreenCanvas render worker (fallback main thread)
