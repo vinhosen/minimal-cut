@@ -209,7 +209,7 @@ export function App() {
     setColors(next);
   }, []);
 
-  // Forward-declared so the video controller and WebCodecs decoder can request a redraw once a frame lands.
+  // Forward-declared so the video controller (rVFC / seeked) and WebCodecs decoder can trigger redraws.
   const drawNowRef = useRef<(time: number) => void>(() => {});
   const videoSyncRef = useRef<VideoSyncController | null>(null);
   const getVideoSync = useCallback(() => {
@@ -217,7 +217,7 @@ export function App() {
       videoSyncRef.current = new VideoSyncController(
         () => assetsMapRef.current,
         () => {
-          if (!isPlayingRef.current) drawNowRef.current(playheadRef.current);
+          drawNowRef.current(playheadRef.current);
         }
       );
     }
@@ -374,7 +374,12 @@ export function App() {
 
   const syncVideoElements = useCallback(
     (time: number, forceSeek: boolean) => {
-      getVideoSync().sync(time, clipsRef.current, isPlayingRef.current, forceSeek);
+      const sync = getVideoSync();
+      if (forceSeek) {
+        sync.seekDiscrete(time, clipsRef.current, isPlayingRef.current);
+      } else {
+        sync.updatePlayback(time, clipsRef.current);
+      }
     },
     [getVideoSync]
   );

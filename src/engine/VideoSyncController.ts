@@ -1,27 +1,55 @@
 import type { MediaAsset, TimelineClip } from '../types/editor';
 import { clipEnd, clipSourceTime, findActiveClip, findNextClip, isSeamlessContinuation } from '../utils/clipTime';
 
-/** How far ahead (seconds) we start preparing the next clip on a standby element. */
+/** How far ahead (seconds) we pre-roll the next clip on a standby element (once per clip). */
 const LOOKAHEAD_SEC = 1.5;
-/** While playing, only hard-seek when drift exceeds this; smaller drift is corrected via playbackRate. */
-const HARD_SEEK_DRIFT_PLAYING = 0.35;
-const SOFT_SYNC_DRIFT = 0.03;
-const SCRUB_SEEK_DRIFT = 0.01;
+/** Minimum cooldown (ms) between corrective drift seeks so the decoder can settle without stuttering. */
+const DRIFT_SEEK_COOLDOWN_MS = 250;
+
+type VideoWithRVFC = HTMLVideoElement & {
+  requestVideoFrameCallback?: (cb: (now: number, metadata: unknown) => void) => number;
+  cancelVideoFrameCallback?: (handle: number) => void;
+};
+
+export interface PlaybackSyncOptions {
+  /**
+   * Phase 2 AudioContext Master Clock drift threshold (seconds).
+   * When undefined (Phase 1 standalone), NO corrective seeks happen during continuous playback.
+   * When set (e.g. 0.08 = 80ms), a corrective seek is issued ONLY if `|videoTimelineTime - time| > threshold`.
+   */
+  driftThresholdSec?: number;
+  /**
+   * When true (Phase 2), always mute underlying `<video>` elements so all audio passes
+   * exclusively through the Web Audio graph.
+   */
+  alwaysMuteVideo?: boolean;
+}
 
 /**
- * Drives <video> elements for preview playback.
+ * Flicker-Free Double-Buffered Video Playback Controller (Phase 1 + Phase 2 drift slaving).
  *
- * - Double buffering: every video asset gets a hidden standby element. The next clip after a hard
- *   cut is pre-seeked on a free element so the switch at the cut point needs no seek (no flicker).
- * - Soft sync: small drift between the master clock and the video is corrected by nudging
- *   playbackRate instead of seeking (seeking caused periodic stutter).
- * - When an asset's audio is decoded into an AudioBuffer, its elements are muted and audio is
- *   scheduled sample-accurately by the Web Audio engine instead.
+ * Strict Guardrails:
+ * - NEVER assigns `video.currentTime` continuously inside `requestAnimationFrame`.
+ * - Restricts programmatic seeks strictly to discrete events:
+ *   1. User scrubbing / manual pause / step (`seekDiscrete`)
+ *   2. Playback start / loop wrap (`seekDiscrete`)
+ *   3. Clip-to-clip boundary transitions (`active.id !== lastActiveClipId`)
+ *   4. Phase 2 Master Clock drift recovery ONLY when `|videoTimelineTime - audioMasterTime| > 0.08` (80ms)
+ * - Pairs native `video.play()` with `video.requestVideoFrameCallback()` (falling back to rAF).
+ * - Maintains a standby `<video>` element per asset and pre-rolls upcoming clips ONCE per boundary.
  */
 export class VideoSyncController {
   private assignment = new Map<string, HTMLVideoElement>();
   private standby = new Map<string, HTMLVideoElement>();
   private attached = new WeakSet<HTMLVideoElement>();
+  private lastActiveClipId: string | null = null;
+  private preRolledClipId: string | null = null;
+  private lastCorrectiveSeekMs = 0;
+  private proxyMode = false;
+
+  private vfcVideo: VideoWithRVFC | null = null;
+  private vfcHandle: number | null = null;
+
   private readonly getAssets: () => Map<string, MediaAsset>;
   private readonly onFrameReady: () => void;
 
@@ -37,7 +65,53 @@ export class VideoSyncController {
     return clip.mediaId ? this.getAssets().get(clip.mediaId)?.videoEl : undefined;
   }
 
-  private attach(el: HTMLVideoElement) {
+  /**
+   * Reads native `video.currentTime` from the currently playing forward clip and maps it back
+   * to timeline seconds (Phase 1 native playback clock readback).
+   */
+  getActiveVideoTimelineTime(clips: TimelineClip[]): number | null {
+    if (!this.lastActiveClipId) return null;
+    const clip = clips.find((c) => c.id === this.lastActiveClipId);
+    if (!clip || clip.reverse) return null;
+    const el = this.assignment.get(clip.id);
+    if (!el || el.paused || el.seeking || el.readyState < 2) return null;
+    const spd = clip.speed || 1;
+    const timelineTime = clip.timelineStart + (el.currentTime - clip.sourceStart) / spd;
+    return Number.isFinite(timelineTime) ? timelineTime : null;
+  }
+
+  private cancelVfc(): void {
+    if (this.vfcVideo && this.vfcHandle !== null) {
+      try {
+        this.vfcVideo.cancelVideoFrameCallback?.(this.vfcHandle);
+      } catch {
+        // ignore
+      }
+    }
+    this.vfcVideo = null;
+    this.vfcHandle = null;
+  }
+
+  private attachVfc(el: HTMLVideoElement | undefined, playing: boolean): void {
+    const v = el as VideoWithRVFC | undefined;
+    if (!playing || !v || typeof v.requestVideoFrameCallback !== 'function') {
+      this.cancelVfc();
+      return;
+    }
+    if (this.vfcVideo === v && this.vfcHandle !== null) return;
+    this.cancelVfc();
+    this.vfcVideo = v;
+    const onVideoFrame = () => {
+      this.vfcHandle = null;
+      this.onFrameReady();
+      if (this.vfcVideo === v && !v.paused) {
+        this.vfcHandle = v.requestVideoFrameCallback!(onVideoFrame);
+      }
+    };
+    this.vfcHandle = v.requestVideoFrameCallback(onVideoFrame);
+  }
+
+  private attach(el: HTMLVideoElement): void {
     if (this.attached.has(el)) return;
     this.attached.add(el);
     el.preload = 'auto';
@@ -45,11 +119,10 @@ export class VideoSyncController {
     el.addEventListener('loadeddata', this.onFrameReady);
   }
 
-  private proxyMode = false;
-
-  setProxyMode(enabled: boolean) {
+  setProxyMode(enabled: boolean): void {
     if (this.proxyMode === enabled) return;
     this.proxyMode = enabled;
+    this.preRolledClipId = null;
     this.getAssets().forEach((asset) => {
       if (asset.type !== 'video' || !asset.videoEl) return;
       const targetSrc = enabled && asset.proxyUrl ? asset.proxyUrl : asset.url;
@@ -96,8 +169,7 @@ export class VideoSyncController {
     return els.find((e) => !used.has(e)) ?? els[0];
   }
 
-  sync(time: number, clips: TimelineClip[], playing: boolean, forceSeek: boolean) {
-    const assets = this.getAssets();
+  private assignClips(time: number, clips: TimelineClip[]) {
     const active = findActiveClip(clips, 'video', time);
     const next = findNextClip(clips, 'video', active ? clipEnd(active) : time, active?.id);
     const upcoming = next && next.timelineStart - time <= LOOKAHEAD_SEC ? next : undefined;
@@ -105,86 +177,171 @@ export class VideoSyncController {
     const keep = new Map<string, HTMLVideoElement>();
     const activeEl = active ? this.pick(active, keep) : undefined;
     if (active && activeEl) keep.set(active.id, activeEl);
+
     let upcomingEl: HTMLVideoElement | undefined;
     if (upcoming) {
       upcomingEl =
-        active && activeEl && isSeamlessContinuation(active, upcoming) ? activeEl : this.pick(upcoming, keep);
+        active && activeEl && isSeamlessContinuation(active, upcoming)
+          ? activeEl
+          : this.pick(upcoming, keep);
       if (upcomingEl) keep.set(upcoming.id, upcomingEl);
     }
     this.assignment = keep;
 
-    if (active && activeEl) {
-      const asset = assets.get(active.mediaId!);
-      this.driveActive(activeEl, active, asset, time, playing, forceSeek);
-    }
-
-    // Pre-roll the next clip after a hard cut: park it paused on its first frame.
-    if (upcoming && upcomingEl && upcomingEl !== activeEl) {
-      upcomingEl.muted = true;
-      if (!upcomingEl.paused) upcomingEl.pause();
-      const tgt = clipSourceTime(upcoming, upcoming.timelineStart);
-      if (!upcomingEl.seeking && Math.abs(upcomingEl.currentTime - tgt) > 0.02) {
-        upcomingEl.currentTime = tgt;
-      }
-    }
-
-    const used = new Set(keep.values());
-    assets.forEach((asset) => {
+    // Pause all idle elements outside active clip bounds
+    this.getAssets().forEach((asset) => {
       if (asset.type !== 'video' || !asset.videoEl) return;
       for (const el of [asset.videoEl, this.standby.get(asset.id)]) {
-        if (el && !used.has(el) && !el.paused) el.pause();
+        if (el && el !== activeEl && !el.paused) {
+          el.pause();
+        }
       }
     });
+
+    return { active, activeEl, upcoming, upcomingEl };
   }
 
-  private driveActive(
-    el: HTMLVideoElement,
-    clip: TimelineClip,
-    asset: MediaAsset | undefined,
-    time: number,
-    playing: boolean,
-    forceSeek: boolean
-  ) {
-    const spd = clip.speed || 1;
-    const duration = asset?.duration ?? el.duration;
-    const tgt = Math.max(0, Math.min(clipSourceTime(clip, time), duration || Infinity));
-    const audioFromBuffer = Boolean(asset?.audioBuffer);
-    el.muted = audioFromBuffer || clip.muted || clip.reverse;
-    el.volume = Math.min(1, Math.max(0, (clip.volume ?? 100) / 100));
-
-    if (clip.reverse) {
-      // Browsers cannot play backwards: step by seeking (Phase 3 decoder replaces this).
-      if (!el.paused) el.pause();
-      if (forceSeek || (!el.seeking && Math.abs(el.currentTime - tgt) > 0.015)) el.currentTime = tgt;
+  private preRollUpcoming(
+    upcoming: TimelineClip | undefined,
+    upcomingEl: HTMLVideoElement | undefined,
+    activeEl: HTMLVideoElement | undefined
+  ): void {
+    if (!upcoming || !upcomingEl || upcomingEl === activeEl) {
+      if (!upcoming) this.preRolledClipId = null;
       return;
     }
-
-    const drift = el.currentTime - tgt;
-    const seekThreshold = playing ? HARD_SEEK_DRIFT_PLAYING : SCRUB_SEEK_DRIFT;
-    if (forceSeek || Math.abs(drift) > seekThreshold) {
-      if (forceSeek || !el.seeking) el.currentTime = tgt;
-      el.playbackRate = spd;
-    } else if (playing && Math.abs(drift) > SOFT_SYNC_DRIFT) {
-      // Video ahead (drift > 0) → slow down slightly, behind → speed up slightly.
-      el.playbackRate = spd * Math.min(1.1, Math.max(0.9, 1 - drift * 0.8));
-    } else if (el.playbackRate !== spd) {
-      el.playbackRate = spd;
+    if (this.preRolledClipId === upcoming.id) return;
+    this.preRolledClipId = upcoming.id;
+    upcomingEl.muted = true;
+    if (!upcomingEl.paused) upcomingEl.pause();
+    const tgt = clipSourceTime(upcoming, upcoming.timelineStart);
+    if (!upcomingEl.seeking && Math.abs(upcomingEl.currentTime - tgt) > 0.02) {
+      upcomingEl.currentTime = tgt;
     }
-
-    if (playing && el.paused) el.play().catch(() => {});
-    else if (!playing && !el.paused) el.pause();
   }
 
-  pauseAll() {
+  /**
+   * DISCRETE seek handler: called ONLY on discrete user/transport events
+   * (user timeline scrub, manual step, play start, loop wrap).
+   */
+  seekDiscrete(
+    time: number,
+    clips: TimelineClip[],
+    playing: boolean,
+    opts: PlaybackSyncOptions = {}
+  ): void {
+    const assets = this.getAssets();
+    const { active, activeEl, upcoming, upcomingEl } = this.assignClips(time, clips);
+    this.lastActiveClipId = active?.id ?? null;
+    this.preRolledClipId = null;
+
+    if (active && activeEl) {
+      const asset = assets.get(active.mediaId!);
+      const spd = active.speed || 1;
+      const duration = asset?.duration ?? activeEl.duration;
+      const tgt = Math.max(0, Math.min(clipSourceTime(active, time), duration || Infinity));
+
+      activeEl.muted = Boolean(opts.alwaysMuteVideo || asset?.audioBuffer || active.muted || active.reverse);
+      activeEl.volume = Math.min(1, Math.max(0, (active.volume ?? 100) / 100));
+      activeEl.playbackRate = spd;
+
+      if (Math.abs(activeEl.currentTime - tgt) > 0.004) {
+        activeEl.currentTime = tgt;
+      }
+
+      if (playing && !active.reverse) {
+        if (activeEl.paused) activeEl.play().catch(() => {});
+      } else if (!activeEl.paused) {
+        activeEl.pause();
+      }
+    }
+
+    this.attachVfc(active && !active.reverse ? activeEl : undefined, playing);
+    this.preRollUpcoming(upcoming, upcomingEl, activeEl);
+  }
+
+  /**
+   * Continuous playback update called during active playback.
+   *
+   * - NEVER assigns `video.currentTime` on steady-state frames.
+   * - Detects discrete clip-to-clip boundary transitions (`active.id !== lastActiveClipId`)
+   *   and switches smoothly to the pre-rolled standby element (or seeks once at the boundary).
+   * - Optionally checks AudioContext master clock drift when `opts.driftThresholdSec` is set
+   *   (80ms threshold in Phase 2) with cooldown protection against micro-stuttering.
+   */
+  updatePlayback(
+    time: number,
+    clips: TimelineClip[],
+    opts: PlaybackSyncOptions = {}
+  ): void {
+    const assets = this.getAssets();
+    const prevClipId = this.lastActiveClipId;
+    const prevClip = prevClipId ? clips.find((c) => c.id === prevClipId) : undefined;
+    const { active, activeEl, upcoming, upcomingEl } = this.assignClips(time, clips);
+
+    const isBoundaryTransition = (active?.id ?? null) !== prevClipId;
+    this.lastActiveClipId = active?.id ?? null;
+
+    if (active && activeEl) {
+      const asset = assets.get(active.mediaId!);
+      const spd = active.speed || 1;
+      const duration = asset?.duration ?? activeEl.duration;
+      const tgt = Math.max(0, Math.min(clipSourceTime(active, time), duration || Infinity));
+
+      activeEl.muted = Boolean(opts.alwaysMuteVideo || asset?.audioBuffer || active.muted || active.reverse);
+      activeEl.volume = Math.min(1, Math.max(0, (active.volume ?? 100) / 100));
+      if (activeEl.playbackRate !== spd) {
+        activeEl.playbackRate = spd;
+      }
+
+      if (active.reverse) {
+        // Reversed video is decoded by FilmCraft WebCodecs WcSource when available; keep <video> paused.
+        if (!activeEl.paused) activeEl.pause();
+        if (isBoundaryTransition && Math.abs(activeEl.currentTime - tgt) > 0.02) {
+          activeEl.currentTime = tgt;
+        }
+      } else {
+        // 1. Discrete clip-to-clip boundary transition
+        if (isBoundaryTransition) {
+          const seamless = Boolean(prevClip && isSeamlessContinuation(prevClip, active));
+          if (!seamless && Math.abs(activeEl.currentTime - tgt) > 0.04) {
+            activeEl.currentTime = tgt;
+            this.lastCorrectiveSeekMs = performance.now();
+          }
+        } else if (opts.driftThresholdSec !== undefined && !activeEl.seeking && activeEl.readyState >= 2) {
+          // 2. Phase 2 Master Clock drift check (strict 80ms threshold + cooldown to prevent micro-stutter)
+          const videoTimelineTime = active.timelineStart + (activeEl.currentTime - active.sourceStart) / spd;
+          const drift = Math.abs(videoTimelineTime - time);
+          const nowMs = performance.now();
+          if (drift > opts.driftThresholdSec && nowMs - this.lastCorrectiveSeekMs >= DRIFT_SEEK_COOLDOWN_MS) {
+            activeEl.currentTime = tgt;
+            this.lastCorrectiveSeekMs = nowMs;
+          }
+        }
+
+        if (activeEl.paused) {
+          activeEl.play().catch(() => {});
+        }
+      }
+    }
+
+    this.attachVfc(active && !active.reverse ? activeEl : undefined, true);
+    this.preRollUpcoming(upcoming, upcomingEl, activeEl);
+  }
+
+  pauseAll(): void {
+    this.cancelVfc();
     this.getAssets().forEach((asset) => {
+      if (asset.type !== 'video') return;
       if (asset.videoEl && !asset.videoEl.paused) asset.videoEl.pause();
       const sb = this.standby.get(asset.id);
       if (sb && !sb.paused) sb.pause();
     });
   }
 
-  /** Releases standby elements (e.g. on "new project"). */
-  reset() {
+  /** Releases standby elements and cancels callbacks (e.g. on "new project" or unmount). */
+  reset(): void {
+    this.cancelVfc();
     this.standby.forEach((el) => {
       el.pause();
       el.removeAttribute('src');
@@ -192,5 +349,7 @@ export class VideoSyncController {
     });
     this.standby.clear();
     this.assignment.clear();
+    this.lastActiveClipId = null;
+    this.preRolledClipId = null;
   }
 }
